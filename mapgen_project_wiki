@@ -97,6 +97,21 @@ W katalogu joba sa m.in.:
 - `tmp/` - katalog tymczasowy podczas pracy.
 - `map.xcm` - wynikowy plik.
 
+Wazne operacyjnie: gotowe mapy z web generatora sa w wolumenie Dockera, nie
+w katalogu repo na hoscie. Najwygodniej szukac ich wewnatrz kontenera workera:
+
+```sh
+docker exec mapgen-mapgen-worker-1 \
+  find /opt/mapgen/jobs -name job -exec grep -a -l pi1PL {} +
+```
+
+Po znalezieniu katalogu joba gotowa mapa lezy obok pliku `job` jako `map.xcm`,
+np. `/opt/mapgen/jobs/<uuid>/map.xcm`. Do wyniesienia jej na hosta uzyj:
+
+```sh
+docker cp mapgen-mapgen-worker-1:/opt/mapgen/jobs/<uuid>/map.xcm /tmp/pi1PL.xcm
+```
+
 Worker usuwa stare joby po 7 dniach. `.locked` i `.working` starsze niz godzina
 sa traktowane jako wygasle i usuwane.
 
