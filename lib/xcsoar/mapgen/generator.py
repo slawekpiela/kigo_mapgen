@@ -150,7 +150,13 @@ Check the source data repository manifest for exact data-source notices.
 
         self.__files.add(dst, True)
 
-    def add_topology(self, bounds=None, compressed=False, level_of_detail=3):
+    def add_topology(
+        self,
+        bounds=None,
+        compressed=False,
+        level_of_detail=3,
+        excluded_topology_layers=None,
+    ):
         print("Adding topology...")
 
         if not bounds:
@@ -160,7 +166,12 @@ Check the source data repository manifest for exact data-source notices.
 
         self.__files.extend(
             shapefiles.create(
-                bounds, self.__downloader, self.__dir_temp, compressed, level_of_detail
+                bounds,
+                self.__downloader,
+                self.__dir_temp,
+                compressed,
+                level_of_detail,
+                excluded_topology_layers,
             )
         )
 

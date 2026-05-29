@@ -68,6 +68,7 @@ class Server(object):
         desc = JobDescription()
         desc.name = name
         desc.mail = params["mail"]
+        desc.omit_path_track_lines = "omit_path_track_lines" in params
         if "ultrahighres" in params:
             desc.resolution = 1.0
         elif "highres" in params:

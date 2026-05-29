@@ -113,15 +113,30 @@ def __create_index_file(dir_temp, index):
     return os.path.join(dir_temp, "topology.tpl")
 
 
-def create(bounds, downloader, dir_temp, compressed=False, level_of_detail=3):
+def __layer_is_excluded(layer, excluded_layers):
+    return layer["name"] in excluded_layers or layer["layer"] in excluded_layers
+
+
+def create(
+    bounds,
+    downloader,
+    dir_temp,
+    compressed=False,
+    level_of_detail=3,
+    excluded_layers=None,
+):
     topology = downloader.manifest()["topology"]
     layers = topology["layers"]
     datasets = topology["datasets"]
+    excluded_layers = set(excluded_layers or ())
 
     files = FileList()
     index = []
     for layer in layers:
-        if layer["level_of_detail"] <= level_of_detail:
+        if (
+            layer["level_of_detail"] <= level_of_detail
+            and not __layer_is_excluded(layer, excluded_layers)
+        ):
             __create_layer(
                 bounds,
                 layer,
