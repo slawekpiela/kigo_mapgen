@@ -6,11 +6,47 @@ import shelve
 import time
 import traceback
 import fcntl
+import unicodedata
+from urllib.parse import quote
 from genshi.filters import HTMLFormFiller
 from xcsoar.mapgen.server.job import Job, JobDescription
 from xcsoar.mapgen.server import view
 from xcsoar.mapgen.georect import GeoRect
 from xcsoar.mapgen.waypoints.parser import parse_waypoint_file
+
+
+def _download_filename(name):
+    stem = (name or "").strip()
+    if not stem:
+        stem = "map"
+
+    filename = "".join(
+        "_" if char in "/\\" or ord(char) < 32 or ord(char) == 127 else char
+        for char in stem
+    ).strip(" .")
+    return (filename or "map") + ".xcm"
+
+
+def _ascii_download_filename(filename):
+    normalized = unicodedata.normalize("NFKD", filename)
+    ascii_filename = normalized.encode("ascii", "ignore").decode("ascii")
+    safe = []
+    for char in ascii_filename:
+        if char.isalnum() or char in " ._-":
+            safe.append(char)
+        else:
+            safe.append("_")
+    fallback = "".join(safe).strip(" ._")
+    return fallback or "map.xcm"
+
+
+def _content_disposition(name):
+    filename = _download_filename(name)
+    fallback = _ascii_download_filename(filename)
+    encoded = quote(filename, safe="")
+    return "attachment; filename=\"{}\"; filename*=UTF-8''{}".format(
+        fallback, encoded
+    )
 
 
 class Server(object):
@@ -171,6 +207,9 @@ class Server(object):
         job = Job.find(self.__dir_jobs, uuid)
         if not job or job.status() != "Done":
             return self.status(uuid)
-        return cherrypy.lib.static.serve_download(
-            job.map_file(), job.description.name + ".xcm"
+        cherrypy.response.headers["Content-Disposition"] = _content_disposition(
+            job.description.name
+        )
+        return cherrypy.lib.static.serve_file(
+            job.map_file(), "application/octet-stream"
         )
