@@ -1,0 +1,409 @@
+# mapgen_project_wiki
+
+Techniczna mapa projektu `kigo_mapgen` / XCSoar mapgen.
+Stan spisany 2026-05-29, po lokalnych zmianach Kigo.
+
+Ten plik ma byc szybkim przewodnikiem dla kolejnych sesji pracy:
+gdzie szukac kodu, jak plynie generowanie mapy, co restartowac, gdzie sa logi
+i jakie zmienne srodowiskowe steruja zachowaniem.
+
+## Najwazniejsze fakty
+
+- Glowny checkout na serwerze: `/home/slawek/mapgen`.
+- Produkcyjny deployment na `anton` dziala przez Docker Compose.
+- Frontend: kontener `mapgen-mapgen-frontend-1`, port hosta `9091 -> 9090`.
+- Worker: kontener `mapgen-mapgen-worker-1`.
+- Joby sa wspoldzielone przez wolumen Docker: `/opt/mapgen/jobs`.
+- Cache danych mapowych jest w wolumenie Docker: `/opt/mapgen/data`.
+- Lokalny high-quality data repository jest bind-mountowany z hosta:
+  `/home/slawek/mapgen-data-nowa_mapa2/repo` -> `/opt/mapgen/high-quality-data`.
+- Remote upstream XCSoar: `origin = https://github.com/XCSoar/mapgen.git`.
+- Remote fork Kigo: `kigo = https://github.com/slawekpiela/kigo_mapgen.git`.
+- Na `anton` push przez HTTPS do GitHuba zwykle nie dziala bez credentials.
+  W praktyce commity byly wypychane bundlem przez lokalny klucz SSH.
+
+## Struktura katalogow
+
+```text
+bin/
+  mapgen                 CLI do jednorazowego tworzenia .xcm
+  mapgen-server          CherryPy web server
+  mapgen-worker          petla workera pobierajaca joby z kolejki
+  mapgen-jobs            prosty check liczby jobow queued/working/error
+
+container/
+  frontend/Dockerfile    obraz z nginx + supervisord + CherryPy frontend
+  worker/Dockerfile      obraz z GDAL, 7zr, wget, mapserver-bin i workerem
+
+docs/
+  better-data.md         notatki o lepszych danych, LOD4 i high-quality mode
+
+lib/xcsoar/mapgen/
+  generator.py           fasada budowy mapy: info, attribution, topology, terrain, zip
+  downloader.py          pobieranie/copy danych z MAPGEN_DATA_URL, checksumy, cache
+  terrain/srtm.py        DEM/terrain przez GDAL, water polygons, JP2
+  topology/shapefiles.py topology z manifestu przez ogr2ogr/shptree, topology.tpl
+  waypoints/             parsery i writer CUP/DAT/Welt2000
+  server/
+    server.py            web form -> JobDescription -> kolejka
+    job.py               format joba i stan katalogu .queued/.working/.error
+    worker.py            wykonanie joba i logi metryk
+    views/               Genshi templates
+    static/              OpenLayers/JS/CSS
+```
+
+## Przeplyw generowania przez WWW
+
+1. Uzytkownik otwiera formularz z `server/views/index.html`.
+2. `server/server.py:Server.index()` obsluguje POST.
+3. Tworzony jest `JobDescription` z opcjami:
+   `name`, `mail`, `bounds`, `resolution`, `level_of_detail`, `compressed`,
+   `welt2000`, `high_quality`, `omit_path_track_lines`.
+4. `Job(self.__dir_jobs, desc)` tworzy katalog:
+   `/opt/mapgen/jobs/<uuid>.locked`.
+5. `job.enqueue()` serializuje `JobDescription` przez pickle i zmienia katalog na:
+   `/opt/mapgen/jobs/<uuid>.queued`.
+6. `mapgen-worker` cyklicznie wywoluje `Job.get_next()`.
+7. Najstarszy `.queued` jest zmieniany na `.working`.
+8. `server/worker.py:Worker.__do_job()` buduje mape:
+   - `Generator.set_bounds()`
+   - `Generator.add_information_file()`
+   - `Generator.add_attribution_file()`
+   - `Generator.add_topology()`
+   - `Generator.add_terrain()`
+   - waypointy/Welt2000, jesli wybrane
+   - `Generator.create(job.map_file())`
+   - `Generator.cleanup()`
+9. Sukces zmienia katalog joba na `/opt/mapgen/jobs/<uuid>`.
+10. Blad zmienia katalog na `/opt/mapgen/jobs/<uuid>.error`.
+11. Frontend `/status?uuid=...` pokazuje status, a `/download?uuid=...` serwuje
+    `map.xcm` jako `<name>.xcm`.
+
+## Job states
+
+`server/job.py` reprezentuje job jako katalog z suffixem:
+
+- `.locked` - job dopiero tworzony.
+- `.queued` - czeka na workera.
+- `.working` - worker go aktualnie wykonuje.
+- `.error` - generowanie zakonczylo sie bledem.
+- brak suffixu - gotowy do pobrania.
+
+W katalogu joba sa m.in.:
+
+- `job` - pickle z `JobDescription`.
+- `timestamp` - czas utworzenia.
+- `status` - tekstowy status widoczny w UI, usuwany po sukcesie.
+- `tmp/` - katalog tymczasowy podczas pracy.
+- `map.xcm` - wynikowy plik.
+
+Worker usuwa stare joby po 7 dniach. `.locked` i `.working` starsze niz godzina
+sa traktowane jako wygasle i usuwane.
+
+## CLI `bin/mapgen`
+
+Przydatne do reprodukcji bez web UI:
+
+```sh
+./bin/mapgen -r 1 -l 4 -b <left> <right> <top> <bottom> output.xcm
+```
+
+Opcje:
+
+- `-r` - rozdzielczosc terenu w arcseconds/pixel. `1` uzywa DEM1.
+- `-l` - level of detail topology, 1..4.
+- `-c` - kompresja topology shapefile w `.xcm`.
+- `--omit-path-track-lines` - usuwa `path_line` i `track_line`, zostawia drogi.
+- `-w2` - dodaje Welt2000 waypoint database.
+- `-b left right top bottom` - reczne granice.
+- `-w waypoint_file` - waypoint file i bounds wyliczane z pliku.
+
+## Downloader i data repository
+
+`lib/xcsoar/mapgen/downloader.py` korzysta z `MAPGEN_DATA_URL`.
+
+Domyslnie:
+
+```text
+https://mapgen-data.sigkill.ch/
+```
+
+Kigo high-quality uzywa lokalnego repo przez URL:
+
+```text
+file:///opt/mapgen/high-quality-data/
+```
+
+W repo danych musza istniec:
+
+- `checksums` - md5 i nazwy plikow.
+- `manifest` - JSON z `topology.layers`, `topology.datasets`, `attribution`.
+- archiwa danych topology, np. `*.7z`.
+- DEM tiles, np. `dem1/n49e019.tif` albo `dem3/n49e019.hgt`.
+- water polygons.
+
+Downloader:
+
+- kopiuje lokalnie z `file://` albo pobiera `wget` dla HTTP(S),
+- sprawdza checksumy,
+- cacheuje pliki w `/opt/mapgen/data`,
+- rozpakowuje `.7z` przy `retrieve_extracted()`.
+
+## Topology
+
+Kod: `lib/xcsoar/mapgen/topology/shapefiles.py`.
+
+Zrodlo konfiguracji: `downloader.manifest()["topology"]`.
+
+Kazda warstwa manifestu ma zwykle:
+
+- `name` - nazwa output shapefile i wpisu w `topology.tpl`,
+- `layer` - nazwa warstwy w danych zrodlowych,
+- `dataset` - klucz datasetu,
+- `level_of_detail`,
+- `range`,
+- `color`,
+- opcjonalnie `pen_width`, `label`, `where`, `alpha`.
+
+Przeplyw:
+
+1. Warstwy filtrowane sa przez `level_of_detail`.
+2. Warstwy moga byc wykluczone przez `excluded_topology_layers`, np.
+   `("path_line", "track_line")`.
+3. Datasets sa filtrowane po przecieciu z `GeoRect`.
+4. `ogr2ogr` wycina shapefile po `-spat`.
+5. `shptree` tworzy `.qix`.
+6. Tworzony jest `topology.tpl`.
+
+Wazne: w `topology.tpl` wiekszy `range` znaczy widocznosc od dalszego zoomu,
+bo renderer pokazuje warstwe gdy `map_scale <= range`.
+
+Kigo opcja `omit_path_track_lines`:
+
+- web checkbox: `Omit path and track lines from topography (keeps roads)`,
+- CLI: `--omit-path-track-lines`,
+- worker przekazuje `excluded_topology_layers=("path_line", "track_line")`.
+
+## Terrain
+
+Kod: `lib/xcsoar/mapgen/terrain/srtm.py`.
+
+Przeplyw:
+
+1. Bounds sa zaokraglane do wymiarow kompatybilnych z kaflami JP2 256x256.
+2. Dataset DEM:
+   - env `MAPGEN_DEM_DATASET`, jesli ustawiony,
+   - inaczej `dem1` dla `arcseconds_per_pixel <= 1.5`,
+   - inaczej `dem3`.
+3. Rozszerzenia:
+   - env `MAPGEN_DEM_EXTENSIONS`, lista po przecinku,
+   - inaczej dla DEM1 `hgt,tif`,
+   - dla DEM3 `hgt`.
+4. `gdalwarp` laczy i resampluje tile do `terrain.tif`.
+5. `gdal_rasterize` maskuje water polygons.
+6. `gdal_translate` tworzy `terrain.jp2`.
+7. World file `terrain.tfw` jest przemianowany na `terrain.j2w`.
+
+## High-quality web mode
+
+Web checkbox:
+
+```text
+Generate high quality Kigo map
+```
+
+Gdy zaznaczony:
+
+- `resolution = 1.0`,
+- `level_of_detail = 4`,
+- `compressed = False`,
+- worker tymczasowo ustawia:
+  - `MAPGEN_DATA_URL = MAPGEN_HIGH_QUALITY_DATA_URL`,
+  - `MAPGEN_DEM_DATASET = MAPGEN_HIGH_QUALITY_DEM_DATASET` albo `dem1`,
+  - `MAPGEN_DEM_EXTENSIONS = MAPGEN_HIGH_QUALITY_DEM_EXTENSIONS` albo `tif`.
+
+Docker Compose przekazuje:
+
+```text
+MAPGEN_HIGH_QUALITY_DATA_URL=file:///opt/mapgen/high-quality-data/
+MAPGEN_HIGH_QUALITY_DEM_DATASET=dem1
+MAPGEN_HIGH_QUALITY_DEM_EXTENSIONS=tif
+MAPGEN_HIGH_QUALITY_DATA_DIR=/home/slawek/mapgen-data-nowa_mapa2/repo
+```
+
+Manualna reprodukcja:
+
+```sh
+MAPGEN_DATA_URL=file:///home/slawek/mapgen-data-nowa_mapa2/repo \
+MAPGEN_DEM_EXTENSIONS=tif \
+./bin/mapgen -r 1 -l 4 -b <left> <right> <top> <bottom> output.xcm
+```
+
+## Rate limit
+
+`Server.too_many_requests()` nadal istnieje w kodzie, ale nie jest wywolywane
+przy POST formularza. Limit "three maps per hour" jest wiec usuniety
+funkcjonalnie, a metoda zostala jako martwy/stary kod.
+
+## Logi metryk generowania
+
+Kod: `server/worker.py:Worker.__log_job_metrics()`.
+
+Kazdy job loguje linie do stdout kontenera workera:
+
+```text
+mapgen_job_metrics uuid=<uuid> status=<done|error|deleted> name='<name>' bounds="left=...,right=...,top=...,bottom=..." elapsed_seconds=<s> estimated_power_watts=<W> estimated_energy_wh=<Wh> estimated_energy_kwh=<kWh>
+```
+
+Gdzie czytac:
+
+```sh
+cd ~/mapgen
+docker compose logs -f mapgen-worker | grep mapgen_job_metrics
+```
+
+Albo:
+
+```sh
+docker logs mapgen-mapgen-worker-1 | grep mapgen_job_metrics
+```
+
+Moc do szacowania energii:
+
+```text
+MAPGEN_ESTIMATED_POWER_WATTS
+```
+
+Domyslnie w `docker-compose.yml`: `25`.
+
+Wzor:
+
+```text
+estimated_energy_wh = estimated_power_watts * elapsed_seconds / 3600
+```
+
+To jest szacunek, nie odczyt z licznika.
+
+## Deployment na anton
+
+Status:
+
+```sh
+cd ~/mapgen
+docker compose ps
+```
+
+Logi frontend:
+
+```sh
+docker compose logs -f mapgen-frontend
+```
+
+Logi worker:
+
+```sh
+docker compose logs -f mapgen-worker
+```
+
+Przebudowa frontendu po zmianach w `server.py`, templates, static:
+
+```sh
+cd ~/mapgen
+docker compose build mapgen-frontend
+docker compose up -d mapgen-frontend
+```
+
+Przebudowa workera po zmianach w `worker.py`, `generator.py`, `downloader.py`,
+terrain/topology/waypoints:
+
+```sh
+cd ~/mapgen
+docker compose build mapgen-worker
+docker compose up -d mapgen-worker
+```
+
+Przed restartem workera warto sprawdzic, czy nie ma aktywnego joba:
+
+```sh
+docker exec mapgen-mapgen-worker-1 sh -c \
+  'find /opt/mapgen/jobs -maxdepth 1 -type d \( -name "*.working" -o -name "*.locked" -o -name "*.queued" \) -print'
+```
+
+## Testy i smoke checks
+
+Skladnia Python bez zapisu do repo `__pycache__`:
+
+```sh
+PYTHONPYCACHEPREFIX=/tmp/mapgen-pycache-slawek python3 -m py_compile \
+  lib/xcsoar/mapgen/downloader.py \
+  lib/xcsoar/mapgen/generator.py \
+  lib/xcsoar/mapgen/server/server.py \
+  lib/xcsoar/mapgen/server/worker.py \
+  lib/xcsoar/mapgen/topology/shapefiles.py \
+  lib/xcsoar/mapgen/terrain/srtm.py \
+  bin/mapgen
+```
+
+Whitespace check przed commitem:
+
+```sh
+git diff --check
+git diff --cached --check
+```
+
+Smoke linii metryk w live workerze:
+
+```sh
+docker exec -e PYTHONPATH=/opt/mapgen/lib mapgen-mapgen-worker-1 python3 -c \
+'import time; from xcsoar.mapgen.server.worker import Worker; Bounds = type("Bounds", (), {"left": 19.0, "right": 20.0, "top": 50.0, "bottom": 49.0}); Description = type("Description", (), {"name": "smoke", "bounds": Bounds()}); Job = type("Job", (), {"uuid": "smoke-uuid", "description": Description()}); worker = Worker("/tmp", "/tmp", ""); worker._Worker__log_job_metrics(Job(), time.monotonic() - 2.5, "done")'
+```
+
+## Typowy workflow commit/push
+
+Na `anton`:
+
+```sh
+cd ~/mapgen
+git status --short --branch
+git diff --check
+git add <files>
+git commit -m "<message>"
+git bundle create /tmp/kigo_mapgen_<shortsha>.bundle master
+```
+
+Na lokalnym Macu, gdy push z `anton` nie ma GitHub credentials:
+
+```sh
+scp -i ~/.ssh/anton.prv slawek@212.244.228.113:/tmp/kigo_mapgen_<shortsha>.bundle .
+git clone ./kigo_mapgen_<shortsha>.bundle ./kigo_mapgen_push_<shortsha>
+git -C ./kigo_mapgen_push_<shortsha> remote set-url origin git@github.com:slawekpiela/kigo_mapgen.git
+git -C ./kigo_mapgen_push_<shortsha> push origin master
+```
+
+## Czeste pulapki
+
+- Repo na `anton` pokazuje `ahead N` wzgledem `origin/master`, bo `origin` to
+  upstream XCSoar. Dla Kigo istotny jest remote `kigo`.
+- Kod w kontenerach jest kopiowany do obrazu w Dockerfile. Sama zmiana pliku na
+  hoście nie wystarczy; trzeba przebudowac odpowiedni obraz i odtworzyc
+  kontener.
+- SSH do `anton` czasem odmawia po wielu krotkich polaczeniach. Odczekaj
+  10-30 sekund i probuj pojedynczym polaczeniem.
+- `py_compile` w repo moze trafic na problem zapisu do `__pycache__`; uzyj
+  `PYTHONPYCACHEPREFIX=/tmp/...`.
+- `JobDescription` jest picklowany, wiec nowe atrybuty powinny miec sensowne
+  domyslne wartosci na klasie, a worker powinien uzywac `getattr()` dla
+  kompatybilnosci ze starymi jobami.
+- `topology.tpl` `range` dziala odwrotnie niz intuicyjny "minimalny zoom":
+  warstwa pokazuje sie, gdy `map_scale <= range`.
+
+## Gdzie zaczac kolejna zmiane
+
+- Nowa opcja formularza: `server/views/index.html`, `server/server.py`,
+  ewentualnie `server/job.py` i `server/worker.py`.
+- Nowa opcja CLI: `bin/mapgen`, potem `generator.py`.
+- Zmiana warstw topologii: `topology/shapefiles.py` i manifest repo danych.
+- Zmiana DEM/terrain: `terrain/srtm.py`, env `MAPGEN_DEM_*`.
+- Zmiana cache/pobierania danych: `downloader.py`.
+- Zmiana deploymentu: `docker-compose.yml`, Dockerfile w `container/`.
+- Debug jobow: `/opt/mapgen/jobs`, `docker compose logs -f mapgen-worker`.
