@@ -58,7 +58,7 @@ lib/xcsoar/mapgen/
 2. `server/server.py:Server.index()` obsluguje POST.
 3. Tworzony jest `JobDescription` z opcjami:
    `name`, `mail`, `bounds`, `resolution`, `level_of_detail`, `compressed`,
-   `welt2000`, `high_quality`, `omit_path_track_lines`.
+   `welt2000`, `high_quality`, `omit_path_lines`, `omit_track_lines`.
 4. `Job(self.__dir_jobs, desc)` tworzy katalog:
    `/opt/mapgen/jobs/<uuid>.locked`.
 5. `job.enqueue()` serializuje `JobDescription` przez pickle i zmienia katalog na:
@@ -113,7 +113,9 @@ Opcje:
 - `-r` - rozdzielczosc terenu w arcseconds/pixel. `1` uzywa DEM1.
 - `-l` - level of detail topology, 1..4.
 - `-c` - kompresja topology shapefile w `.xcm`.
-- `--omit-path-track-lines` - usuwa `path_line` i `track_line`, zostawia drogi.
+- `--omit-path-lines` - usuwa `path_line`, zostawia drogi.
+- `--omit-track-lines` - usuwa `track_line`, zostawia drogi.
+- `--omit-path-track-lines` - ukryty alias kompatybilnosciowy, usuwa obie warstwy.
 - `-w2` - dodaje Welt2000 waypoint database.
 - `-b left right top bottom` - reczne granice.
 - `-w waypoint_file` - waypoint file i bounds wyliczane z pliku.
@@ -169,7 +171,7 @@ Przeplyw:
 
 1. Warstwy filtrowane sa przez `level_of_detail`.
 2. Warstwy moga byc wykluczone przez `excluded_topology_layers`, np.
-   `("path_line", "track_line")`.
+   `path_line`, `track_line` albo obie warstwy.
 3. Datasets sa filtrowane po przecieciu z `GeoRect`.
 4. `ogr2ogr` wycina shapefile po `-spat`.
 5. `shptree` tworzy `.qix`.
@@ -178,11 +180,12 @@ Przeplyw:
 Wazne: w `topology.tpl` wiekszy `range` znaczy widocznosc od dalszego zoomu,
 bo renderer pokazuje warstwe gdy `map_scale <= range`.
 
-Kigo opcja `omit_path_track_lines`:
+Kigo opcje `omit_path_lines` i `omit_track_lines`:
 
-- web checkbox: `Omit path and track lines from topography (keeps roads)`,
-- CLI: `--omit-path-track-lines`,
-- worker przekazuje `excluded_topology_layers=("path_line", "track_line")`.
+- web checkbox: `Omit path lines from topography (keeps roads)`,
+- web checkbox: `Omit track lines from topography (keeps roads)`,
+- CLI: `--omit-path-lines` i `--omit-track-lines`,
+- worker przekazuje `excluded_topology_layers` z wybranymi warstwami.
 
 ## Terrain
 

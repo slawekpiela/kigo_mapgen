@@ -69,6 +69,8 @@ class Server(object):
         desc.name = name
         desc.mail = params["mail"]
         desc.high_quality = "high_quality" in params
+        desc.omit_path_lines = "omit_path_lines" in params
+        desc.omit_track_lines = "omit_track_lines" in params
         desc.omit_path_track_lines = "omit_path_track_lines" in params
         if desc.high_quality:
             desc.resolution = 1.0

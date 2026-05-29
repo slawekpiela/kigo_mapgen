@@ -21,6 +21,8 @@ class JobDescription:
     download_url = None
     compressed = False
     level_of_detail = 3
+    omit_path_lines = False
+    omit_track_lines = False
     omit_path_track_lines = False
     welt2000 = False
     high_quality = False

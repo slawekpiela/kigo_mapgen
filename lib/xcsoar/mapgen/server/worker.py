@@ -176,13 +176,19 @@ This link is valid for 7 days.
 
                 if description.use_topology:
                     job.update_status("Creating topology files...")
-                    excluded_topology_layers = ()
-                    if getattr(description, "omit_path_track_lines", False):
-                        excluded_topology_layers = ("path_line", "track_line")
+                    excluded_topology_layers = []
+                    if getattr(description, "omit_path_lines", False) or getattr(
+                        description, "omit_path_track_lines", False
+                    ):
+                        excluded_topology_layers.append("path_line")
+                    if getattr(description, "omit_track_lines", False) or getattr(
+                        description, "omit_path_track_lines", False
+                    ):
+                        excluded_topology_layers.append("track_line")
                     generator.add_topology(
                         compressed=description.compressed,
                         level_of_detail=description.level_of_detail,
-                        excluded_topology_layers=excluded_topology_layers,
+                        excluded_topology_layers=tuple(excluded_topology_layers),
                     )
 
                 if description.use_terrain:
