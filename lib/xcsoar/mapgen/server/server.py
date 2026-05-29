@@ -131,11 +131,6 @@ class Server(object):
                 data=params
             )
 
-        if self.too_many_requests():
-            return view.render(
-                error="You can generate only three maps per hour."
-            ) | HTMLFormFiller(data=params)
-
         job = Job(self.__dir_jobs, desc)
 
         if desc.waypoint_file:
