@@ -12,13 +12,80 @@ from xcsoar.mapgen.util import check_commands
 from xcsoar.mapgen.server.config import mapgen
 
 
+DEFAULT_ESTIMATED_POWER_WATTS = 25.0
+
+
 class Worker:
     def __init__(self, dir_jobs, dir_data, mail_server):
         check_commands()
         self.__dir_jobs = os.path.abspath(dir_jobs)
         self.__dir_data = os.path.abspath(dir_data)
         self.__mail_server = mail_server
+        self.__estimated_power_watts = self.__read_estimated_power_watts()
         self.__run = False
+
+    @staticmethod
+    def __read_estimated_power_watts():
+        raw_value = os.environ.get("MAPGEN_ESTIMATED_POWER_WATTS")
+        if not raw_value:
+            return DEFAULT_ESTIMATED_POWER_WATTS
+
+        try:
+            value = float(raw_value)
+        except ValueError:
+            print(
+                (
+                    "Invalid MAPGEN_ESTIMATED_POWER_WATTS={!r}; using {:.1f} W."
+                    .format(raw_value, DEFAULT_ESTIMATED_POWER_WATTS)
+                )
+            )
+            return DEFAULT_ESTIMATED_POWER_WATTS
+
+        if value <= 0:
+            print(
+                (
+                    "Invalid MAPGEN_ESTIMATED_POWER_WATTS={!r}; using {:.1f} W."
+                    .format(raw_value, DEFAULT_ESTIMATED_POWER_WATTS)
+                )
+            )
+            return DEFAULT_ESTIMATED_POWER_WATTS
+
+        return value
+
+    @staticmethod
+    def __format_bounds(bounds):
+        if not bounds:
+            return "none"
+
+        return (
+            "left={:.6f},right={:.6f},top={:.6f},bottom={:.6f}"
+            .format(bounds.left, bounds.right, bounds.top, bounds.bottom)
+        )
+
+    def __log_job_metrics(self, job, started_at, status):
+        try:
+            elapsed_seconds = max(0.0, time.monotonic() - started_at)
+            energy_wh = self.__estimated_power_watts * elapsed_seconds / 3600.0
+            description = job.description
+            print(
+                (
+                    "mapgen_job_metrics uuid={} status={} name={!r} "
+                    "bounds=\"{}\" elapsed_seconds={:.1f} "
+                    "estimated_power_watts={:.1f} estimated_energy_wh={:.4f} "
+                    "estimated_energy_kwh={:.8f}"
+                ).format(
+                    job.uuid,
+                    status,
+                    description.name,
+                    self.__format_bounds(description.bounds),
+                    elapsed_seconds,
+                    self.__estimated_power_watts,
+                    energy_wh,
+                    energy_wh / 1000.0,
+                )
+            )
+        except Exception as e:
+            print(("Failed to log job metrics: {}".format(e)))
 
     def __send_download_mail(self, job):
         try:
@@ -80,6 +147,8 @@ This link is valid for 7 days.
                     os.environ[key] = value
 
     def __do_job(self, job):
+        started_at = time.monotonic()
+        job_status = "error"
         try:
             print(
                 (
@@ -93,6 +162,7 @@ This link is valid for 7 days.
             if not description.waypoint_file and not description.bounds:
                 print("No waypoint file or bounds set. Aborting.")
                 job.delete()
+                job_status = "deleted"
                 return
 
             with self.__data_environment(description) as dir_data:
@@ -145,11 +215,14 @@ This link is valid for 7 days.
 
                 shutil.rmtree(job.file_path("tmp"))
                 job.done()
+                job_status = "done"
         except Exception as e:
             print(("Error: {}".format(e)))
             traceback.print_exc(file=sys.stdout)
             job.error()
             return
+        finally:
+            self.__log_job_metrics(job, started_at, job_status)
 
         print(("Map {} is ready for use.".format(job.map_file())))
         if job.description.mail != "":

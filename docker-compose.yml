@@ -21,6 +21,7 @@ services:
       - MAPGEN_HIGH_QUALITY_DATA_URL=${MAPGEN_HIGH_QUALITY_DATA_URL:-file:///opt/mapgen/high-quality-data/}
       - MAPGEN_HIGH_QUALITY_DEM_DATASET=${MAPGEN_HIGH_QUALITY_DEM_DATASET:-dem1}
       - MAPGEN_HIGH_QUALITY_DEM_EXTENSIONS=${MAPGEN_HIGH_QUALITY_DEM_EXTENSIONS:-tif}
+      - MAPGEN_ESTIMATED_POWER_WATTS=${MAPGEN_ESTIMATED_POWER_WATTS:-25}
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
       - mapgen-data:/opt/mapgen/data
