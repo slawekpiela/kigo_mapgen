@@ -24,18 +24,19 @@ def main():
         dest="resolution",
         type=float,
         default=9.0,
-        help="resolution of the terrain in arcseconds per pixel",
+        help="resolution of the terrain in arcseconds per pixel; 1 requires dem1-compatible data",
     )
     parser.add_argument(
         "-l",
         metavar="level_of_detail",
         dest="level_of_detail",
-        choices=[1, 2, 3],
+        choices=[1, 2, 3, 4],
         type=int,
         default=3,
         help="""1: only major topography,
                                 2: medium level of detail,
-                                3: every tiny city name and road""",
+                                3: every tiny city name and road,
+                                4: ultra detail from a custom data source""",
     )
     parser.add_argument(
         "-c",
@@ -95,6 +96,7 @@ def main():
             generator.add_waypoint_file(args.waypoint_file)
 
         generator.add_information_file(args.output_file)
+        generator.add_attribution_file()
         generator.add_topology(
             compressed=args.compressed, level_of_detail=args.level_of_detail
         )

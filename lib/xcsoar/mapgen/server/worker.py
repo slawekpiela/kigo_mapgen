@@ -66,6 +66,7 @@ This link is valid for 7 days.
 
             generator.set_bounds(description.bounds)
             generator.add_information_file(job.description.name, job.description.mail)
+            generator.add_attribution_file()
 
             if description.use_topology:
                 job.update_status("Creating topology files...")

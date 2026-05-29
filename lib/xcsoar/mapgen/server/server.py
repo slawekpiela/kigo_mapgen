@@ -68,15 +68,20 @@ class Server(object):
         desc = JobDescription()
         desc.name = name
         desc.mail = params["mail"]
-        desc.resolution = 3.0 if "highres" in params else 9.0
+        if "ultrahighres" in params:
+            desc.resolution = 1.0
+        elif "highres" in params:
+            desc.resolution = 3.0
+        else:
+            desc.resolution = 9.0
         desc.compressed = "compressed" in params
         desc.welt2000 = "welt2000" in params
         desc.level_of_detail = int(params["level_of_detail"])
 
         selection = params["selection"]
-        waypoint_file = params["waypoint_file"]
+        waypoint_file = params.get("waypoint_file")
         if selection in ["waypoint", "waypoint_bounds"]:
-            if not waypoint_file.file or not waypoint_file.filename:
+            if not waypoint_file or not waypoint_file.file or not waypoint_file.filename:
                 return view.render(error="No waypoint file uploaded.") | HTMLFormFiller(
                     data=params
                 )

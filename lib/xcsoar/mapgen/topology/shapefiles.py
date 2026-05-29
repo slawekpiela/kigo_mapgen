@@ -24,7 +24,7 @@ def __create_layer_from_dataset(bounds, layer, dataset, append, downloader, dir_
     data_dir = downloader.retrieve_extracted(dataset["name"] + ".7z")
 
     print(("Reading dataset {} ...".format(dataset["name"])))
-    arg = [__cmd_ogr2ogr, "-skipfailures"]
+    arg = [__cmd_ogr2ogr, "-skipfailures", "-lco", "ENCODING=UTF-8"]
 
     if append:
         arg.append("-update")

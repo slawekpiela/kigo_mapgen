@@ -32,14 +32,20 @@ def __get_tile_name(lat, lon):
     return "" + ns + "{0:02}".format(lat) + ew + "{0:03}".format(lon)
 
 
-def __retrieve_tile(downloader, dir_temp, lat, lon):
+def __retrieve_tile(downloader, dir_temp, lat, lon, dataset, extensions):
     filename = __get_tile_name(lat, lon)
-    hgt_file = downloader.retrieve("dem3/{}.hgt".format(filename))
-    print(("Tile {} found.".format(filename)))
-    return hgt_file
+    last_error = None
+    for extension in extensions:
+        try:
+            dem_file = downloader.retrieve("{}/{}.{}".format(dataset, filename, extension))
+            print(("Tile {}.{} found in {}.".format(filename, extension, dataset)))
+            return dem_file
+        except Exception as e:
+            last_error = e
+    raise last_error
 
 
-def __retrieve_tiles(downloader, dir_temp, bounds):
+def __retrieve_tiles(downloader, dir_temp, bounds, dataset, extensions):
     """
     Makes sure the terrain tiles are available at a certain location.
     @param downloader: Downloader
@@ -63,7 +69,9 @@ def __retrieve_tiles(downloader, dir_temp, bounds):
     for lat in range(lat_start, lat_end, 1):
         for lon in range(lon_start, lon_end, 1):
             try:
-                tiles.append(__retrieve_tile(downloader, dir_temp, lat, lon))
+                tiles.append(
+                    __retrieve_tile(downloader, dir_temp, lat, lon, dataset, extensions)
+                )
             except Exception as e:
                 print(
                     (
@@ -131,6 +139,8 @@ def __create(dir_temp, tiles, arcseconds_per_pixel, bounds):
         str(degree_per_pixel),
         str(degree_per_pixel),
         "-wt",
+        "Int16",
+        "-ot",
         "Int16",
         "-dstnodata",
         "-31744",
@@ -224,6 +234,24 @@ def __cleanup(dir_temp):
             os.unlink(os.path.join(dir_temp, file))
 
 
+def __get_dem_dataset(arcseconds_per_pixel):
+    dataset = os.environ.get("MAPGEN_DEM_DATASET")
+    if dataset:
+        return dataset
+    if float(arcseconds_per_pixel) <= 1.5:
+        return "dem1"
+    return "dem3"
+
+
+def __get_dem_extensions(arcseconds_per_pixel):
+    extensions = os.environ.get("MAPGEN_DEM_EXTENSIONS")
+    if extensions:
+        return [extension.strip() for extension in extensions.split(",") if extension.strip()]
+    if float(arcseconds_per_pixel) <= 1.5:
+        return ["hgt", "tif"]
+    return ["hgt"]
+
+
 def create(bounds, arcseconds_per_pixel, downloader, dir_temp):
     # calculate height and width (in pixels) of map from geo coordinates
     px = round((bounds.right - bounds.left) * 3600 / arcseconds_per_pixel)
@@ -237,7 +265,10 @@ def create(bounds, arcseconds_per_pixel, downloader, dir_temp):
     bounds.bottom = bounds.top - (py * arcseconds_per_pixel / 3600)
 
     # Make sure the tiles are available
-    tiles = __retrieve_tiles(downloader, dir_temp, bounds)
+    dataset = __get_dem_dataset(arcseconds_per_pixel)
+    extensions = __get_dem_extensions(arcseconds_per_pixel)
+    print("Using DEM dataset {} with extensions {}...".format(dataset, ",".join(extensions)))
+    tiles = __retrieve_tiles(downloader, dir_temp, bounds, dataset, extensions)
     if len(tiles) < 1:
         return FileList()
 

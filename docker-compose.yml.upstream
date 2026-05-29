@@ -6,7 +6,7 @@ services:
       dockerfile: ./container/frontend/Dockerfile
     image: ghcr.io/xcsoar/mapgen-frontend
     ports:
-      - "9091:9090"
+      - "9090:9090"
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
   mapgen-worker:
@@ -14,10 +14,6 @@ services:
       context: .
       dockerfile: ./container/worker/Dockerfile
     image: ghcr.io/xcsoar/mapgen-worker
-    environment:
-      - MAPGEN_DATA_URL=${MAPGEN_DATA_URL:-https://mapgen-data.sigkill.ch/}
-      - MAPGEN_DEM_DATASET=${MAPGEN_DEM_DATASET:-}
-      - MAPGEN_DEM_EXTENSIONS=${MAPGEN_DEM_EXTENSIONS:-}
     volumes:
       - mapgen-jobs:/opt/mapgen/jobs
       - mapgen-data:/opt/mapgen/data

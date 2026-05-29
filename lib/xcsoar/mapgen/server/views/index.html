@@ -26,12 +26,16 @@
     <label for="highres">Include the <a href="https://github.com/XCSoar/xcsoar-data-content/tree/master/waypoints">XCSoar Waypoint Database</a></label><br/>
     <input type="checkbox" name="highres" id="highres" value="1"/>
     <label for="highres">High resolution terrain (3 arcseconds per pixel instead of 9)</label><br/>
+    <input type="checkbox" name="ultrahighres" id="ultrahighres" value="1"/>
+    <label for="ultrahighres">Ultra resolution terrain (1 arcsecond per pixel, requires dem1 data)</label><br/>
     <input type="checkbox" name="compressed" id="compressed"/>
     <label for="compressed">Compressed topography (smaller filesize, but slower)</label><br/>
     <hr/>
     <span style="font-size: 10pt;">Level of detail:</span><br/>
+    <input type="radio" name="level_of_detail" value="4" id="radio_lod4"/>
+    <label for="radio_lod4">4: Ultra detail from a custom OSM data source.</label><br/>
     <input type="radio" name="level_of_detail" value="3" id="radio_lod3" checked="checked"/>
-    <label for="radio_bounds">3: Every little village and road that we know of.</label><br/>
+    <label for="radio_lod3">3: Every little village and road that we know of.</label><br/>
     <input type="radio" name="level_of_detail" value="2" id="radio_lod2"/>
     <label for="radio_waypoint">2: No small villages or smaller roads.</label><br/>
     <input type="radio" name="level_of_detail" value="1" id="radio_lod1"/>

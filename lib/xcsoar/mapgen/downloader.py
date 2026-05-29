@@ -10,7 +10,11 @@ from xcsoar.mapgen.util import slurp, spew
 
 class Downloader:
     def __init__(self, dir):
-        self.__base_url = "https://mapgen-data.sigkill.ch/"
+        self.__base_url = os.environ.get(
+            "MAPGEN_DATA_URL", "https://mapgen-data.sigkill.ch/"
+        )
+        if not self.__base_url.endswith("/"):
+            self.__base_url += "/"
         self.__cmd_7zip = "7zr"
         self.__cmd_wget = "wget"
         self.__dir = os.path.abspath(dir)
