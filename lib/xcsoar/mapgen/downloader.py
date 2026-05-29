@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import subprocess
 import json
+from urllib.parse import unquote, urlparse
 
 from xcsoar.mapgen.util import slurp, spew
 
@@ -15,22 +16,19 @@ class Downloader:
         )
         if not self.__base_url.endswith("/"):
             self.__base_url += "/"
+        self.__local_base_dir = None
+        if self.__base_url.startswith("file://"):
+            parsed = urlparse(self.__base_url)
+            self.__local_base_dir = os.path.abspath(unquote(parsed.path))
+            if not os.path.isdir(self.__local_base_dir):
+                raise RuntimeError("Local data repository does not exist: " + self.__local_base_dir)
         self.__cmd_7zip = "7zr"
         self.__cmd_wget = "wget"
         self.__dir = os.path.abspath(dir)
         self.__manifest = None
         if not os.path.exists(self.__dir):
             os.makedirs(self.__dir)
-        subprocess.check_call(
-            [
-                self.__cmd_wget,
-                "-q",
-                "-N",
-                "-P",
-                self.__dir,
-                self.__base_url + "checksums",
-            ]
-        )
+        self.__fetch("checksums", os.path.join(self.__dir, "checksums"))
         self.__checksums = {}
         for line in slurp(os.path.join(self.__dir, "checksums")).split("\n"):
             line = line.strip()
@@ -118,10 +116,21 @@ class Downloader:
         if not os.path.exists(dest):
             if file not in self.__checksums:
                 raise RuntimeError("{} does not exist on the server.".format(file))
-            url = self.__base_url + file
-            if not os.path.exists(os.path.dirname(dest)):
-                os.makedirs(os.path.dirname(dest))
-            subprocess.check_call([self.__cmd_wget, "-O", dest, url])
+            self.__fetch(file, dest)
+
+    def __fetch(self, file, dest):
+        if not os.path.exists(os.path.dirname(dest)):
+            os.makedirs(os.path.dirname(dest))
+
+        if self.__local_base_dir:
+            source = os.path.join(self.__local_base_dir, file)
+            if not os.path.isfile(source):
+                raise RuntimeError("{} does not exist in local data repository.".format(file))
+            shutil.copyfile(source, dest)
+            return
+
+        url = self.__base_url + file
+        subprocess.check_call([self.__cmd_wget, "-O", dest, url])
 
     def __remove(self, *files):
         for file in files:

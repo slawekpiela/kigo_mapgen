@@ -23,6 +23,7 @@ class JobDescription:
     level_of_detail = 3
     omit_path_track_lines = False
     welt2000 = False
+    high_quality = False
 
 
 class Job:

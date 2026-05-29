@@ -68,16 +68,22 @@ class Server(object):
         desc = JobDescription()
         desc.name = name
         desc.mail = params["mail"]
+        desc.high_quality = "high_quality" in params
         desc.omit_path_track_lines = "omit_path_track_lines" in params
-        if "ultrahighres" in params:
+        if desc.high_quality:
             desc.resolution = 1.0
-        elif "highres" in params:
-            desc.resolution = 3.0
+            desc.level_of_detail = 4
+            desc.compressed = False
         else:
-            desc.resolution = 9.0
-        desc.compressed = "compressed" in params
+            if "ultrahighres" in params:
+                desc.resolution = 1.0
+            elif "highres" in params:
+                desc.resolution = 3.0
+            else:
+                desc.resolution = 9.0
+            desc.level_of_detail = int(params["level_of_detail"])
+            desc.compressed = "compressed" in params
         desc.welt2000 = "welt2000" in params
-        desc.level_of_detail = int(params["level_of_detail"])
 
         selection = params["selection"]
         waypoint_file = params.get("waypoint_file")

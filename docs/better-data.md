@@ -86,3 +86,32 @@ Recommended additional OSM layers for gliding maps:
 
 Keep ranges small for dense layers.  Very detailed shapefiles can make `.xcm`
 files large and can slow down rendering in XCSoar.
+
+## Web high-quality mode
+
+The web frontend exposes a single "high quality" option for the map style used
+by Kigo test maps around EPBA/Bielsko.  It reproduces the manual generation
+path:
+
+```sh
+MAPGEN_DATA_URL=file:///opt/mapgen/high-quality-data/ \
+MAPGEN_DEM_EXTENSIONS=tif \
+./bin/mapgen -r 1 -l 4 -b <left> <right> <top> <bottom> output.xcm
+```
+
+When this option is selected, the server stores the job with:
+
+- terrain resolution `1.0` arcsecond per pixel,
+- topology level of detail `4`,
+- uncompressed topology, matching the manual path,
+- the data repository from `MAPGEN_HIGH_QUALITY_DATA_URL`.
+
+For Docker Compose, mount the prepared repository and start the worker with:
+
+```sh
+MAPGEN_HIGH_QUALITY_DATA_DIR=/home/slawek/mapgen-data-nowa_mapa2/repo docker compose up -d --force-recreate mapgen-worker
+```
+
+The generated `.xcm` includes `ATTRIBUTION.txt`.  Its contents come from the
+custom repository `manifest` `attribution` field, which must list the real data
+sources, for example OpenStreetMap/Geofabrik and Copernicus DEM GLO-30.
