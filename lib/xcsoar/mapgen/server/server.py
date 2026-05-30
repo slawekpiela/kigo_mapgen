@@ -105,6 +105,7 @@ class Server(object):
         desc.name = name
         desc.mail = params["mail"]
         desc.high_quality = "high_quality" in params
+        desc.terrain_plus = "terrain_plus" in params
         desc.omit_path_lines = "omit_path_lines" in params
         desc.omit_track_lines = "omit_track_lines" in params
         desc.omit_path_track_lines = "omit_path_track_lines" in params
@@ -113,13 +114,15 @@ class Server(object):
             desc.level_of_detail = 4
             desc.compressed = False
         else:
-            if "ultrahighres" in params:
+            if desc.terrain_plus or "ultrahighres" in params:
                 desc.resolution = 1.0
             elif "highres" in params:
                 desc.resolution = 3.0
             else:
                 desc.resolution = 9.0
-            desc.level_of_detail = int(params["level_of_detail"])
+            desc.level_of_detail = 3 if desc.terrain_plus else int(
+                params["level_of_detail"]
+            )
             desc.compressed = "compressed" in params
         desc.welt2000 = "welt2000" in params
 

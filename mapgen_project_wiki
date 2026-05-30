@@ -58,7 +58,8 @@ lib/xcsoar/mapgen/
 2. `server/server.py:Server.index()` obsluguje POST.
 3. Tworzony jest `JobDescription` z opcjami:
    `name`, `mail`, `bounds`, `resolution`, `level_of_detail`, `compressed`,
-   `welt2000`, `high_quality`, `omit_path_lines`, `omit_track_lines`.
+   `welt2000`, `high_quality`, `terrain_plus`, `omit_path_lines`,
+   `omit_track_lines`.
 4. `Job(self.__dir_jobs, desc)` tworzy katalog:
    `/opt/mapgen/jobs/<uuid>.locked`.
 5. `job.enqueue()` serializuje `JobDescription` przez pickle i zmienia katalog na:
@@ -239,6 +240,15 @@ Gdy zaznaczony:
   - `MAPGEN_DATA_URL = MAPGEN_HIGH_QUALITY_DATA_URL`,
   - `MAPGEN_DEM_DATASET = MAPGEN_HIGH_QUALITY_DEM_DATASET` albo `dem1`,
   - `MAPGEN_DEM_EXTENSIONS = MAPGEN_HIGH_QUALITY_DEM_EXTENSIONS` albo `tif`.
+
+Opcja `Terrain plus`:
+
+- web checkbox: `Terrain plus (standard topography, 1 arcsecond terrain)`,
+- `resolution = 1.0`,
+- `level_of_detail = 3`, czyli standardowa topografia,
+- worker generuje topologie ze standardowego `MAPGEN_DATA_URL`,
+- tylko etap `Generator.add_terrain()` dostaje downloader z high-quality data
+  repository, z `MAPGEN_HIGH_QUALITY_DEM_DATASET=dem1`.
 
 Docker Compose przekazuje:
 

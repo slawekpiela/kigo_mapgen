@@ -26,6 +26,7 @@ class JobDescription:
     omit_path_track_lines = False
     welt2000 = False
     high_quality = False
+    terrain_plus = False
 
 
 class Job:

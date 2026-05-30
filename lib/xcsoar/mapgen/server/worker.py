@@ -115,15 +115,11 @@ This link is valid for 7 days.
             print(("Failed to send mail: {}".format(e)))
 
     @contextmanager
-    def __data_environment(self, description):
-        if not getattr(description, "high_quality", False):
-            yield self.__dir_data
-            return
-
+    def __high_quality_data_environment(self):
         data_url = os.environ.get("MAPGEN_HIGH_QUALITY_DATA_URL")
         if not data_url:
             raise RuntimeError(
-                "High quality map generation requires MAPGEN_HIGH_QUALITY_DATA_URL."
+                "High quality data generation requires MAPGEN_HIGH_QUALITY_DATA_URL."
             )
 
         overrides = {
@@ -145,6 +141,15 @@ This link is valid for 7 days.
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+    @contextmanager
+    def __data_environment(self, description):
+        if not getattr(description, "high_quality", False):
+            yield self.__dir_data
+            return
+
+        with self.__high_quality_data_environment() as dir_data:
+            yield dir_data
 
     def __do_job(self, job):
         started_at = time.monotonic()
@@ -193,7 +198,15 @@ This link is valid for 7 days.
 
                 if description.use_terrain:
                     job.update_status("Creating terrain files...")
-                    generator.add_terrain(description.resolution)
+                    if getattr(description, "terrain_plus", False) and not getattr(
+                        description, "high_quality", False
+                    ):
+                        with self.__high_quality_data_environment() as terrain_data:
+                            generator.add_terrain(
+                                description.resolution, dir_data=terrain_data
+                            )
+                    else:
+                        generator.add_terrain(description.resolution)
 
                 if description.welt2000:
                     job.update_status("Adding welt2000 waypoints...")

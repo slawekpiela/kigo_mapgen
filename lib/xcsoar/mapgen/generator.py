@@ -175,7 +175,7 @@ Check the source data repository manifest for exact data-source notices.
             )
         )
 
-    def add_terrain(self, arcseconds_per_pixel=9.0, bounds=None):
+    def add_terrain(self, arcseconds_per_pixel=9.0, bounds=None, dir_data=None):
         print("Adding terrain...")
 
         if not bounds:
@@ -183,9 +183,13 @@ Check the source data repository manifest for exact data-source notices.
                 raise RuntimeError("Boundaries undefined.")
             bounds = self.__bounds
 
+        downloader = self.__downloader
+        if dir_data is not None:
+            downloader = Downloader(dir_data)
+
         self.__files.extend(
             srtm.create(
-                bounds, arcseconds_per_pixel, self.__downloader, self.__dir_temp
+                bounds, arcseconds_per_pixel, downloader, self.__dir_temp
             )
         )
 
