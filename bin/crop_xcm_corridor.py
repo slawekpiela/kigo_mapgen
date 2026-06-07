@@ -333,6 +333,19 @@ def crop_terrain(src_dir: Path, dst_dir: Path, bbox):
     crop_h = y1 - y0
     dst = dst_dir / "terrain.jp2"
 
+    if x0 == 0 and y0 == 0 and crop_w == width and crop_h == height:
+        shutil.copy2(src, dst)
+        new_c = c
+        new_f = f
+        (dst_dir / "terrain.j2w").write_text(
+            f"{a:.10f}\n{d:.10f}\n{b:.10f}\n{e:.10f}\n{new_c:.10f}\n{new_f:.10f}\n"
+        )
+        return {
+            "source_pixels": [width, height],
+            "crop_pixels": [crop_w, crop_h],
+            "crop_origin": [x0, y0],
+        }
+
     opj_decompress = tool_path("opj_decompress")
     opj_compress = tool_path("opj_compress")
     if opj_decompress and opj_compress:
