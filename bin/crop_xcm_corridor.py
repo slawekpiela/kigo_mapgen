@@ -283,6 +283,33 @@ def read_world(path: Path):
     return values
 
 
+def xcm_topology_bbox(xcm: Path):
+    """Return the union bbox of all shapefile layers inside *xcm*, or None.
+
+    Reads only the 100-byte shapefile header from each .shp entry (no full
+    geometry load).  Returns None when the XCM contains no shapefile layers.
+    """
+    west = east = north = south = None
+    with zipfile.ZipFile(xcm) as zf:
+        for name in zf.namelist():
+            if not name.lower().endswith(".shp"):
+                continue
+            with zf.open(name) as fh:
+                header = fh.read(100)
+            if len(header) < 68:
+                continue
+            xmin, ymin, xmax, ymax = struct.unpack_from("<dddd", header, 36)
+            if xmin == 0.0 and ymin == 0.0 and xmax == 0.0 and ymax == 0.0:
+                continue
+            west = xmin if west is None else min(west, xmin)
+            south = ymin if south is None else min(south, ymin)
+            east = xmax if east is None else max(east, xmax)
+            north = ymax if north is None else max(north, ymax)
+    if west is None:
+        return None
+    return {"south": south, "west": west, "north": north, "east": east}
+
+
 def crop_terrain(src_dir: Path, dst_dir: Path, bbox):
     src = src_dir / "terrain.jp2"
     world = read_world(src_dir / "terrain.j2w")

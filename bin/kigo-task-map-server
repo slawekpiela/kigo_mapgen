@@ -80,7 +80,8 @@ TASK_MAP_RUNWAY_CACHE_DIR = Path(
 @dataclass(frozen=True)
 class BaseMap:
     path: Path
-    bbox: dict[str, float]
+    bbox: dict[str, float]           # terrain coverage
+    topology_bbox: "dict | None"     # topology coverage, None = no shapefile data
 
 
 def xcm_terrain_bbox(xcm: Path):
@@ -122,7 +123,9 @@ def find_base_maps(configured) -> tuple[BaseMap, ...]:
             continue
         seen.add(candidate)
         if candidate.exists():
-            base_maps.append(BaseMap(candidate, xcm_terrain_bbox(candidate)))
+            terrain_bbox = xcm_terrain_bbox(candidate)
+            topology_bbox = crop.xcm_topology_bbox(candidate)
+            base_maps.append(BaseMap(candidate, terrain_bbox, topology_bbox))
 
     if base_maps:
         return tuple(base_maps)
@@ -593,8 +596,17 @@ def bbox_contains(outer, inner) -> bool:
 
 def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
     for base_map in base_maps:
-        if bbox_contains(base_map.bbox, bbox):
-            return base_map
+        if not bbox_contains(base_map.bbox, bbox):
+            continue
+        if base_map.topology_bbox is None or not bbox_contains(base_map.topology_bbox, bbox):
+            print(
+                f"[base-map] {base_map.path.name}: terrain OK but topology "
+                f"S={base_map.topology_bbox['south'] if base_map.topology_bbox else 'n/a':.4f} "
+                f"does not cover task S={bbox['south']:.4f} — skipping",
+                file=sys.stderr, flush=True,
+            )
+            continue
+        return base_map
 
     formatted = (
         f"{bbox['south']:.6f},{bbox['west']:.6f},"
