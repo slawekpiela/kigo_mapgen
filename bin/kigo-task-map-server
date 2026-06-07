@@ -696,7 +696,7 @@ def _xcm_has_terrain(xcm_bytes):
         return False
 
 
-def generate_map_from_mapgen(bbox, name, runway_features=None, corridor_segments=None, corridor_margin_km=0.0):
+def generate_map_from_mapgen(bbox, name, runway_features=None):
     """Generate a new XCM map via mapgen, inject runways, return bytes or None."""
     try:
         uuid = _mapgen_submit(bbox, name)
@@ -725,9 +725,8 @@ def generate_map_from_mapgen(bbox, name, runway_features=None, corridor_segments
         print(f"[mapgen] download failed {uuid}: {exc}", file=sys.stderr, flush=True)
         return None, f"mapgen download error: {exc}"
 
-    # Optionally inject runway polygons and apply corridor filtering — only
-    # when the generated XCM has terrain (terrain-less maps can't be re-cropped).
-    if _xcm_has_terrain(raw) and (runway_features or (corridor_segments and corridor_margin_km > 0)):
+    # Inject runway polygons into topology if available.
+    if runway_features and _xcm_has_terrain(raw):
         try:
             with tempfile.TemporaryDirectory(prefix="kigo_mapgen_rw_") as tmp:
                 src = Path(tmp) / "base.xcm"
@@ -739,8 +738,6 @@ def generate_map_from_mapgen(bbox, name, runway_features=None, corridor_segments
                     forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
                     extra_polyline_layers=runway_polyline_layers(runway_features),
                     extra_polygon_layers=runway_polygon_layers(runway_features),
-                    corridor_segments=corridor_segments,
-                    corridor_margin_km=corridor_margin_km,
                 )
                 raw = dst.read_bytes()
         except Exception as exc:
@@ -790,7 +787,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("payload must be a JSON object")
-            bbox, corridor_segments = bbox_and_segments_from_payload(payload)
+            bbox = bbox_from_payload(payload)
             validate_bbox(bbox)
         except Exception as exc:
             self.send_text(400, f"bad task map request: {exc}")
@@ -803,54 +800,15 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             runway_error = str(exc)
             runway_source = "none"
 
-        # --- Try crop from existing base map ---
-        base_map = None
-        data = None
-        map_source = "crop"
-        mapgen_error = ""
-        try:
-            base_map = select_base_map(self.base_maps, bbox)
-        except ValueError:
-            pass  # No base map covers this bbox — will fall back to mapgen
-
-        if base_map is not None:
-            try:
-                with tempfile.TemporaryDirectory(prefix="kigo_task_map_http_") as tmp:
-                    output = Path(tmp) / "task_map_30km.xcm"
-                    crop.crop_xcm_to_bbox(
-                        base_map.path,
-                        bbox,
-                        output,
-                        excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
-                        forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
-                        extra_polyline_layers=runway_polyline_layers(runway_features),
-                        extra_polygon_layers=runway_polygon_layers(runway_features),
-                        corridor_segments=corridor_segments,
-                        corridor_margin_km=TASK_MAP_MARGIN_KM,
-                    )
-                    data = output.read_bytes()
-            except Exception as exc:
-                base_map = None
-                data = None
-                mapgen_error = str(exc)
-
-        # --- Fallback: generate from scratch via mapgen ---
+        task_name = str(payload.get("task_name") or "task_map")
+        data, mapgen_error = generate_map_from_mapgen(
+            bbox,
+            f"{task_name}_gen",
+            runway_features=runway_features,
+        )
         if data is None:
-            task_name = str(payload.get("task_name") or "task_map")
-            data, mapgen_error = generate_map_from_mapgen(
-                bbox,
-                f"{task_name}_gen",
-                runway_features=runway_features,
-                corridor_segments=corridor_segments,
-                corridor_margin_km=TASK_MAP_MARGIN_KM,
-            )
-            map_source = "mapgen"
-            if data is None:
-                self.send_text(
-                    500,
-                    f"task map failed: no base map and mapgen error: {mapgen_error}",
-                )
-                return
+            self.send_text(500, f"task map failed: {mapgen_error}")
+            return
 
         bbox_header = (
             f"{bbox['south']:.8f},{bbox['west']:.8f},"
@@ -861,29 +819,23 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", "attachment; filename=task_map_30km.xcm")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Kigo-Bbox", bbox_header)
-        self.send_header("X-Kigo-Base-Map",
-                         base_map.path.name if base_map else "mapgen")
-        self.send_header("X-Kigo-Map-Source", map_source)
+        self.send_header("X-Kigo-Base-Map", "mapgen")
+        self.send_header("X-Kigo-Map-Source", "mapgen")
         self.send_header("X-Kigo-Task-Points", str(payload_point_count(payload)))
-        self.send_header("X-Kigo-Corridor-Segments", str(len(corridor_segments)))
         self.send_header("X-Kigo-Runways", str(len(runway_features)))
         self.send_header("X-Kigo-Runway-Source", runway_source)
         if runway_error:
             self.send_header("X-Kigo-Runway-Error", runway_error[:200])
-        if mapgen_error and map_source == "mapgen":
-            self.send_header("X-Kigo-Mapgen-Note", mapgen_error[:200])
         self.end_headers()
         self.wfile.write(data)
         self.log_message(
-            "task-map generated task=%r source=%s points=%d runways=%d runway_source=%s runway_error=%r bbox=%s base=%s bytes=%d",
+            "task-map generated task=%r source=mapgen points=%d runways=%d runway_source=%s runway_error=%r bbox=%s bytes=%d",
             str(payload.get("task_name") or ""),
-            map_source,
             payload_point_count(payload),
             len(runway_features),
             runway_source,
             runway_error,
             bbox_header,
-            base_map.path.name if base_map else "mapgen",
             len(data),
         )
 
