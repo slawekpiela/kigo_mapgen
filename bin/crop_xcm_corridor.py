@@ -891,6 +891,7 @@ def crop_xcm_to_bbox(
     extra_polygon_layers=None,
     corridor_segments=None,
     corridor_margin_km: float = 0.0,
+    skip_terrain_crop: bool = False,
 ):
     if workdir is None and not keep_workdir:
         with tempfile.TemporaryDirectory(prefix="xcm_crop_") as tmp:
@@ -906,6 +907,7 @@ def crop_xcm_to_bbox(
                 extra_polygon_layers=extra_polygon_layers,
                 corridor_segments=corridor_segments,
                 corridor_margin_km=corridor_margin_km,
+                skip_terrain_crop=skip_terrain_crop,
             )
 
     t0 = time.monotonic()
@@ -936,7 +938,12 @@ def crop_xcm_to_bbox(
     excluded_stems = {stem.lower() for stem in (excluded_vector_stems or ())}
 
     copy_misc_files(src_dir, dst_dir, excluded_stems, forced_topology_rows)
-    terrain_info = crop_terrain(src_dir, dst_dir, bbox)
+    if skip_terrain_crop:
+        shutil.copy2(src_dir / "terrain.jp2", dst_dir / "terrain.jp2")
+        shutil.copy2(src_dir / "terrain.j2w", dst_dir / "terrain.j2w")
+        terrain_info = {"source_pixels": [0, 0], "crop_pixels": [0, 0], "crop_origin": [0, 0]}
+    else:
+        terrain_info = crop_terrain(src_dir, dst_dir, bbox)
 
     stems = sorted({p.stem for p in src_dir.glob("*.shp")})
     vector_stats = []

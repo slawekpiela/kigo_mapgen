@@ -738,6 +738,7 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
                     forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
                     extra_polyline_layers=runway_polyline_layers(runway_features),
                     extra_polygon_layers=runway_polygon_layers(runway_features),
+                    skip_terrain_crop=True,
                 )
                 raw = dst.read_bytes()
         except Exception as exc:
