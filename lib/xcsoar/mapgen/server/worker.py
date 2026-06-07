@@ -198,15 +198,26 @@ This link is valid for 7 days.
 
                 if description.use_terrain:
                     job.update_status("Creating terrain files...")
+                    task_routes = getattr(description, "task_routes", None)
+                    task_terrain_margin = getattr(
+                        description, "task_terrain_margin", 30.0
+                    )
                     if getattr(description, "terrain_plus", False) and not getattr(
                         description, "high_quality", False
                     ):
                         with self.__high_quality_data_environment() as terrain_data:
                             generator.add_terrain(
-                                description.resolution, dir_data=terrain_data
+                                description.resolution,
+                                dir_data=terrain_data,
+                                task_routes=task_routes,
+                                task_terrain_margin=task_terrain_margin,
                             )
                     else:
-                        generator.add_terrain(description.resolution)
+                        generator.add_terrain(
+                            description.resolution,
+                            task_routes=task_routes,
+                            task_terrain_margin=task_terrain_margin,
+                        )
 
                 if description.welt2000:
                     job.update_status("Adding welt2000 waypoints...")

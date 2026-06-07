@@ -40,6 +40,19 @@ def _ascii_download_filename(filename):
     return fallback or "map.xcm"
 
 
+def _copy_upload_file(source, destination):
+    with open(destination, "wb") as target:
+        while True:
+            chunk = source.read(1024 * 64)
+            if not chunk:
+                break
+
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+
+            target.write(chunk)
+
+
 def _content_disposition(name):
     filename = _download_filename(name)
     fallback = _ascii_download_filename(filename)
@@ -128,8 +141,14 @@ class Server(object):
 
         selection = params["selection"]
         waypoint_file = params.get("waypoint_file")
+        has_waypoint_upload = (
+            waypoint_file and waypoint_file.file and waypoint_file.filename
+        )
+        if selection == "bounds" and has_waypoint_upload:
+            selection = "waypoint"
+
         if selection in ["waypoint", "waypoint_bounds"]:
-            if not waypoint_file or not waypoint_file.file or not waypoint_file.filename:
+            if not has_waypoint_upload:
                 return view.render(error="No waypoint file uploaded.") | HTMLFormFiller(
                     data=params
                 )
@@ -144,9 +163,12 @@ class Server(object):
                             waypoint_file.filename
                         )
                     )
-                desc.bounds = parse_waypoint_file(
+                waypoint_list = parse_waypoint_file(
                     waypoint_file.filename, waypoint_file.file
-                ).get_bounds()
+                )
+                desc.bounds = waypoint_list.get_bounds()
+                if waypoint_list.has_task_routes():
+                    desc.task_routes = waypoint_list.get_task_routes()
                 desc.waypoint_file = (
                     "waypoints.cup" if filename.endswith(".cup") else "waypoints.dat"
                 )
@@ -182,11 +204,7 @@ class Server(object):
 
         if desc.waypoint_file:
             waypoint_file.file.seek(0)
-            f = open(job.file_path(desc.waypoint_file), "w")
-            try:
-                shutil.copyfileobj(fsrc=waypoint_file.file, fdst=f, length=1024 * 64)
-            finally:
-                f.close()
+            _copy_upload_file(waypoint_file.file, job.file_path(desc.waypoint_file))
 
         desc.download_url = "/download?uuid=" + job.uuid
         job.enqueue()

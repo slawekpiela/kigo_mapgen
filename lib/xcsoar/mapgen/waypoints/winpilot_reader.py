@@ -3,6 +3,13 @@ from xcsoar.mapgen.waypoints.waypoint import Waypoint
 from xcsoar.mapgen.waypoints.list import WaypointList
 
 
+def __decode_line(line):
+    if isinstance(line, bytes):
+        return line.decode("utf-8", "replace")
+
+    return line
+
+
 def __parse_altitude(str):
     str = str.lower()
     if str.endswith("ft") or str.endswith("f"):
@@ -39,6 +46,7 @@ def parse_winpilot_waypoints(lines):
     waypoint_list = WaypointList()
 
     for line in lines:
+        line = __decode_line(line)
         line = line.strip()
         if line == "" or line.startswith("*"):
             continue

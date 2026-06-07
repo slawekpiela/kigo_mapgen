@@ -102,12 +102,16 @@ def main():
     dir_temp = "/tmp/mapgen-{}".format(os.getpid())
     try:
         generator = Generator(dir_data=os.path.join(app_dir, "data"), dir_temp=dir_temp)
+        task_routes = None
         if args.bounds:
             generator.set_bounds(
                 GeoRect(args.bounds[0], args.bounds[1], args.bounds[2], args.bounds[3])
             )
         elif args.waypoint_file:
-            generator.set_bounds(parse_waypoint_file(args.waypoint_file).get_bounds())
+            waypoint_list = parse_waypoint_file(args.waypoint_file)
+            generator.set_bounds(waypoint_list.get_bounds())
+            if waypoint_list.has_task_routes():
+                task_routes = waypoint_list.get_task_routes()
         else:
             parser.error("no map boundaries specified")
 
@@ -128,7 +132,7 @@ def main():
             level_of_detail=args.level_of_detail,
             excluded_topology_layers=tuple(excluded_topology_layers),
         )
-        generator.add_terrain(args.resolution)
+        generator.add_terrain(args.resolution, task_routes=task_routes)
         generator.create(args.output_file)
         generator.cleanup()
     finally:

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import math
+import json
 import subprocess
 from zipfile import ZipFile, BadZipfile
 
@@ -100,6 +101,115 @@ def __retrieve_waterpolygons(downloader, dir_temp):
 
 
 """
+ 1b) Build a task-corridor polygon for non-rectangular terrain masking
+"""
+
+
+def __destination(lat, lon, distance_km, bearing_degrees):
+    angular_distance = distance_km / 6371.0088
+    bearing = math.radians(bearing_degrees)
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lon)
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(angular_distance)
+        + math.cos(lat1) * math.sin(angular_distance) * math.cos(bearing)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing) * math.sin(angular_distance) * math.cos(lat1),
+        math.cos(angular_distance) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    lon2 = (lon2 + math.pi) % (2 * math.pi) - math.pi
+    return math.degrees(lon2), math.degrees(lat2)
+
+
+def __initial_bearing(start, end):
+    lon1, lat1 = start
+    lon2, lat2 = end
+    lat1 = math.radians(lat1)
+    lat2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(
+        dlon
+    )
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def __circle_polygon(point, distance_km, steps=24):
+    lon, lat = point
+    ring = [
+        list(__destination(lat, lon, distance_km, bearing))
+        for bearing in [i * 360.0 / steps for i in range(steps)]
+    ]
+    ring.append(ring[0])
+    return ring
+
+
+def __segment_polygon(start, end, distance_km):
+    lon1, lat1 = start
+    lon2, lat2 = end
+    if lon1 == lon2 and lat1 == lat2:
+        return None
+
+    bearing = __initial_bearing(start, end)
+    ring = [
+        list(__destination(lat1, lon1, distance_km, bearing - 90.0)),
+        list(__destination(lat2, lon2, distance_km, bearing - 90.0)),
+        list(__destination(lat2, lon2, distance_km, bearing + 90.0)),
+        list(__destination(lat1, lon1, distance_km, bearing + 90.0)),
+    ]
+    ring.append(ring[0])
+    return ring
+
+
+def __normalise_task_route(route):
+    points = []
+    for point in route:
+        if len(point) < 2:
+            continue
+        try:
+            points.append((float(point[0]), float(point[1])))
+        except Exception:
+            continue
+    return points
+
+
+def __create_task_corridor_file(dir_temp, task_routes, distance_km):
+    if not task_routes:
+        return None
+
+    polygons = []
+    for route in task_routes:
+        points = __normalise_task_route(route)
+        if len(points) < 1:
+            continue
+
+        for point in points:
+            polygons.append([__circle_polygon(point, distance_km)])
+
+        for i in range(0, len(points) - 1):
+            ring = __segment_polygon(points[i], points[i + 1], distance_km)
+            if ring is not None:
+                polygons.append([ring])
+
+    if len(polygons) < 1:
+        return None
+
+    path = os.path.join(dir_temp, "terrain_task_corridor.geojson")
+    feature = {
+        "type": "Feature",
+        "properties": {},
+        "geometry": {"type": "MultiPolygon", "coordinates": polygons},
+    }
+    with open(path, "w") as f:
+        json.dump({"type": "FeatureCollection", "features": [feature]}, f)
+    return path
+
+
+"""
  2) Merge tiles into big tif, Resample and Crop merged image
     gdalwarp
     -r cubic
@@ -173,9 +283,28 @@ def __create(dir_temp, tiles, arcseconds_per_pixel, bounds):
 """
 
 
-def __convert(dir_temp, input_file, water_file, rc):
-    print("Masking coastlines...")
+def __convert(dir_temp, input_file, water_file, rc, task_corridor_file=None):
     output_file = os.path.join(dir_temp, "terrain.tif")
+
+    if task_corridor_file is not None:
+        print("Masking terrain outside task corridor...")
+
+        args = [
+            "gdal_rasterize",
+            "-i",
+            "-optim",
+            "VECTOR",
+            "-b",
+            "1",
+            "-burn",
+            "-31744",
+            task_corridor_file,
+            output_file,
+        ]
+
+        subprocess.check_call(args)
+
+    print("Masking coastlines...")
 
     args = [
         "gdal_rasterize",
@@ -252,7 +381,14 @@ def __get_dem_extensions(arcseconds_per_pixel):
     return ["hgt"]
 
 
-def create(bounds, arcseconds_per_pixel, downloader, dir_temp):
+def create(
+    bounds,
+    arcseconds_per_pixel,
+    downloader,
+    dir_temp,
+    task_routes=None,
+    task_terrain_margin=30.0,
+):
     # calculate height and width (in pixels) of map from geo coordinates
     px = round((bounds.right - bounds.left) * 3600 / arcseconds_per_pixel)
     py = round((bounds.top - bounds.bottom) * 3600 / arcseconds_per_pixel)
@@ -275,6 +411,9 @@ def create(bounds, arcseconds_per_pixel, downloader, dir_temp):
     try:
         terrain_file = __create(dir_temp, tiles, arcseconds_per_pixel, bounds)
         water_file = __retrieve_waterpolygons(downloader, dir_temp)
-        return __convert(dir_temp, terrain_file, water_file, bounds)
+        task_corridor_file = __create_task_corridor_file(
+            dir_temp, task_routes, task_terrain_margin
+        )
+        return __convert(dir_temp, terrain_file, water_file, bounds, task_corridor_file)
     finally:
         __cleanup(dir_temp)

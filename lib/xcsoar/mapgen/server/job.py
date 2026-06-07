@@ -27,6 +27,8 @@ class JobDescription:
     welt2000 = False
     high_quality = False
     terrain_plus = False
+    task_routes = None
+    task_terrain_margin = 30.0
 
 
 class Job:
