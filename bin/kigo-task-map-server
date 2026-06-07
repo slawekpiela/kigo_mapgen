@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+"""HTTP task-map service for Kigo remote map generation.
+
+The Pi/Kigo client posts task points and a historical bbox.  This service runs
+on anton, derives the authoritative 30 km task-point bbox from the posted
+points, crops the configured base XCM map, and returns the generated XCM file
+as the HTTP response body.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import crop_xcm_corridor as crop
+
+
+BASE_MAP_CANDIDATES = (
+    "/maps/slawek4.xcm",
+    "/maps/slawek5.xcm",
+    "/maps/POL_HighRes_1arcsec.xcm",
+    "/maps/POL_HighRes_base.xcm",
+    "/maps/nowa_mapa2.xcm",
+    "/maps/nowa_mapa.xcm",
+    "/home/slawek/mapgen-output/slawek4.xcm",
+    "/home/slawek/mapgen-output/slawek5.xcm",
+    "/home/slawek/mapgen-output/POL_HighRes_1arcsec.xcm",
+    "/home/slawek/mapgen-output/POL_HighRes_base.xcm",
+    "/home/slawek/mapgen-output/nowa_mapa2.xcm",
+    "/home/slawek/mapgen-output/nowa_mapa.xcm",
+)
+
+TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset(("path_line", "track_line"))
+TASK_MAP_FORCED_TOPOLOGY_ROWS = {
+    "airstrip_area": "airstrip_area,10,,1,187,187,204,1,1,1,255",
+    "runway_area": "runway_area,20,,0,25,25,25,1,0,0,255",
+    "runway_casing_line": "runway_casing_line,20,,0,0,0,0,15,0,0,255",
+    "runway_line": "runway_line,20,,0,255,255,255,7,0,0,255",
+}
+TASK_MAP_MARGIN_KM = 30.0
+TASK_MAP_RUNWAY_VISIBLE_WIDTH_M = float(
+    os.environ.get("KIGO_TASK_MAP_RUNWAY_VISIBLE_WIDTH_M", "220")
+)
+TASK_MAP_OVERPASS_URLS = tuple(
+    url.strip()
+    for url in os.environ.get(
+        "KIGO_TASK_MAP_OVERPASS_URLS",
+        os.environ.get(
+            "KIGO_TASK_MAP_OVERPASS_URL",
+            "https://overpass-api.de/api/interpreter,"
+            "https://overpass.kumi.systems/api/interpreter",
+        ),
+    ).replace(";", ",").split(",")
+    if url.strip()
+)
+TASK_MAP_OVERPASS_TIMEOUT_S = float(os.environ.get("KIGO_TASK_MAP_OVERPASS_TIMEOUT_S", "25"))
+TASK_MAP_OVERPASS_ATTEMPTS = int(os.environ.get("KIGO_TASK_MAP_OVERPASS_ATTEMPTS", "2"))
+TASK_MAP_RUNWAY_CACHE_DIR = Path(
+    os.environ.get("KIGO_TASK_MAP_RUNWAY_CACHE_DIR", "/tmp/kigo_task_map_runways")
+)
+
+
+@dataclass(frozen=True)
+class BaseMap:
+    path: Path
+    bbox: dict[str, float]
+
+
+def xcm_terrain_bbox(xcm: Path):
+    with zipfile.ZipFile(xcm) as zf, tempfile.TemporaryDirectory(
+        prefix="kigo_task_map_base_"
+    ) as tmp:
+        zf.extract("terrain.j2w", tmp)
+        zf.extract("terrain.jp2", tmp)
+        world_path = Path(tmp) / "terrain.j2w"
+        terrain_path = Path(tmp) / "terrain.jp2"
+
+        a, d, b, e, c, f = crop.read_world(world_path)
+        if abs(b) > 1e-12 or abs(d) > 1e-12 or a <= 0 or e >= 0:
+            raise ValueError("only north-up terrain.j2w files are supported")
+
+        width, height = crop.image_size(terrain_path)
+
+    west = c - a / 2.0
+    east = west + a * width
+    north = f - e / 2.0
+    south = north + e * height
+    return {"south": south, "west": west, "north": north, "east": east}
+
+
+def find_base_maps(configured) -> tuple[BaseMap, ...]:
+    candidates = []
+    if configured is not None:
+        candidates.append(configured)
+
+    env_path = os.environ.get("KIGO_TASK_MAP_BASE_XCM")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    candidates.extend(Path(path) for path in BASE_MAP_CANDIDATES)
+    seen = set()
+    base_maps = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            base_maps.append(BaseMap(candidate, xcm_terrain_bbox(candidate)))
+
+    if base_maps:
+        return tuple(base_maps)
+
+    raise FileNotFoundError(
+        "No base XCM map found. Set --base-xcm or KIGO_TASK_MAP_BASE_XCM."
+    )
+
+
+def number(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    return float(value)
+
+
+def task_map_margin_km(payload) -> float:
+    margin = number(payload.get("margin_km", TASK_MAP_MARGIN_KM), "margin_km")
+    if margin <= 0:
+        raise ValueError("margin_km must be positive")
+
+    return max(TASK_MAP_MARGIN_KM, margin)
+
+
+def bbox_and_segments_from_payload(payload):
+    """Return (bbox, corridor_segments) from payload.
+
+    corridor_segments is a list of ((lat1,lon1),(lat2,lon2)) pairs — one per
+    route leg — used to filter shapefile records to the true 30 km corridor
+    around the task polyline rather than its enclosing rectangle.
+    Returns (bbox, []) when only a bbox dict was supplied (no point list).
+    """
+    points = payload.get("points")
+    if isinstance(points, list) and len(points) >= 2:
+        crop_points = []
+        for index, point in enumerate(points):
+            if not isinstance(point, dict):
+                raise ValueError(f"points[{index}] must be an object")
+            name = str(point.get("name") or f"TP{index + 1:03d}")
+            lat = number(point.get("lat"), f"points[{index}].lat")
+            lon = number(point.get("lon"), f"points[{index}].lon")
+            crop_points.append((name, lat, lon))
+
+        bbox = crop.buffered_bbox(crop_points, task_map_margin_km(payload))
+        segments = crop.route_segments(crop_points)
+        return bbox, segments
+
+    bbox_dict = payload.get("bbox")
+    if isinstance(bbox_dict, dict):
+        return {
+            "south": number(bbox_dict.get("south"), "bbox.south"),
+            "west": number(bbox_dict.get("west"), "bbox.west"),
+            "north": number(bbox_dict.get("north"), "bbox.north"),
+            "east": number(bbox_dict.get("east"), "bbox.east"),
+        }, []
+
+    raise ValueError("payload must contain at least two points or bbox")
+
+
+def bbox_from_payload(payload):
+    bbox, _ = bbox_and_segments_from_payload(payload)
+    return bbox
+
+
+def payload_point_count(payload) -> int:
+    points = payload.get("points")
+    return len(points) if isinstance(points, list) else 0
+
+
+def runway_label(tags) -> str:
+    if not isinstance(tags, dict):
+        return ""
+    return str(tags.get("ref") or tags.get("name") or "")
+
+
+def runway_width_m(tags) -> float:
+    if isinstance(tags, dict):
+        raw_width = tags.get("width") or tags.get("est_width")
+        if raw_width is not None:
+            text = str(raw_width).strip().lower().replace(",", ".")
+            if text.endswith("m"):
+                text = text[:-1].strip()
+            try:
+                width = float(text)
+                if 1 <= width <= 200:
+                    return width
+            except ValueError:
+                pass
+
+    return 45.0
+
+
+def osm_runway_query(bbox):
+    query_timeout = max(20, int(TASK_MAP_OVERPASS_TIMEOUT_S))
+    return (
+        f"[out:json][timeout:{query_timeout}];"
+        f'way["aeroway"="runway"]({bbox["south"]:.8f},{bbox["west"]:.8f},'
+        f'{bbox["north"]:.8f},{bbox["east"]:.8f});'
+        "out geom;"
+    )
+
+
+def fetch_osm_runways(bbox):
+    cached = load_cached_runways(bbox)
+    if cached is not None:
+        return cached, "", "cache"
+
+    try:
+        features = fetch_osm_runways_from_overpass(bbox)
+    except Exception as exc:
+        cached = load_cached_runways(bbox)
+        if cached is not None:
+            return cached, str(exc), "cache-after-error"
+        raise
+
+    save_cached_runways(bbox, features)
+    return features, "", "overpass"
+
+
+def fetch_osm_runways_from_overpass(bbox):
+    query = osm_runway_query(bbox)
+    data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+    last_error = None
+    payload = None
+    attempts = max(1, TASK_MAP_OVERPASS_ATTEMPTS)
+    for _ in range(attempts):
+        for url in TASK_MAP_OVERPASS_URLS:
+            request = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Kigo task map runway fetcher",
+                },
+            )
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=TASK_MAP_OVERPASS_TIMEOUT_S,
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except Exception as exc:
+                last_error = exc
+        if payload is not None:
+            break
+
+    if payload is None:
+        raise last_error or RuntimeError("no Overpass endpoints configured")
+
+    features = []
+    seen = set()
+    for element in payload.get("elements", []):
+        if not isinstance(element, dict):
+            continue
+        tags = element.get("tags") or {}
+        if tags.get("aeroway") != "runway":
+            continue
+
+        points = []
+        for point in element.get("geometry") or ():
+            if not isinstance(point, dict):
+                continue
+            lat = point.get("lat")
+            lon = point.get("lon")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                points.append((float(lon), float(lat)))
+
+        if len(points) < 2:
+            continue
+
+        key = tuple((round(lon, 7), round(lat, 7)) for lon, lat in points)
+        if key in seen:
+            continue
+        seen.add(key)
+        features.append(
+            {
+                "label": runway_label(tags),
+                "points": points,
+                "width_m": runway_width_m(tags),
+            }
+        )
+
+    return features
+
+
+def runway_cache_key(bbox):
+    text = (
+        f"{bbox['south']:.4f},{bbox['west']:.4f},"
+        f"{bbox['north']:.4f},{bbox['east']:.4f}"
+    )
+    return hashlib.sha1(text.encode("ascii")).hexdigest()
+
+
+def runway_feature_bbox(feature):
+    points = feature.get("points") if isinstance(feature, dict) else None
+    if not points:
+        return None
+
+    lons = [float(point[0]) for point in points]
+    lats = [float(point[1]) for point in points]
+    return {
+        "south": min(lats),
+        "west": min(lons),
+        "north": max(lats),
+        "east": max(lons),
+    }
+
+
+def feature_intersects_bbox(feature, bbox):
+    feature_box = runway_feature_bbox(feature)
+    if feature_box is None:
+        return False
+    return not (
+        feature_box["east"] < bbox["west"]
+        or feature_box["west"] > bbox["east"]
+        or feature_box["north"] < bbox["south"]
+        or feature_box["south"] > bbox["north"]
+    )
+
+
+def filter_runways_to_bbox(features, bbox):
+    return [
+        feature
+        for feature in features or ()
+        if feature_intersects_bbox(feature, bbox)
+    ]
+
+
+def normalise_cached_features(raw):
+    features = []
+    for feature in raw or ():
+        if not isinstance(feature, dict):
+            continue
+        points = []
+        for point in feature.get("points") or ():
+            try:
+                lon, lat = point
+            except Exception:
+                continue
+            points.append((float(lon), float(lat)))
+        if len(points) < 2:
+            continue
+        features.append(
+            {
+                "label": str(feature.get("label") or ""),
+                "points": points,
+                "width_m": float(feature.get("width_m") or 45.0),
+            }
+        )
+    return features
+
+
+def load_cached_runways(bbox):
+    cache_dir = TASK_MAP_RUNWAY_CACHE_DIR
+    exact = cache_dir / f"{runway_cache_key(bbox)}.json"
+    candidates = [exact]
+    if cache_dir.exists():
+        candidates.extend(
+            path
+            for path in sorted(cache_dir.glob("*.json"))
+            if path != exact
+        )
+
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            cached_bbox = payload.get("bbox")
+            if not isinstance(cached_bbox, dict):
+                continue
+            if not bbox_contains(cached_bbox, bbox):
+                continue
+            return filter_runways_to_bbox(
+                normalise_cached_features(payload.get("features")),
+                bbox,
+            )
+        except Exception:
+            continue
+
+    return None
+
+
+def save_cached_runways(bbox, features):
+    try:
+        TASK_MAP_RUNWAY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "bbox": bbox,
+            "features": [
+                {
+                    "label": feature.get("label") or "",
+                    "points": feature.get("points") or [],
+                    "width_m": feature.get("width_m") or 45.0,
+                }
+                for feature in features or ()
+            ],
+        }
+        path = TASK_MAP_RUNWAY_CACHE_DIR / f"{runway_cache_key(bbox)}.json"
+        path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def runway_centerline_points(feature):
+    points = feature.get("points") or []
+    if len(points) < 2:
+        return None
+
+    origin_lon = points[0][0]
+    origin_lat = points[0][1]
+    mean_lat = sum(point[1] for point in points) / len(points)
+    meters_per_lat = 111320.0
+    meters_per_lon = max(1.0, meters_per_lat * math.cos(math.radians(mean_lat)))
+    xy = [
+        (
+            (lon - origin_lon) * meters_per_lon,
+            (lat - origin_lat) * meters_per_lat,
+        )
+        for lon, lat in points
+    ]
+
+    closed = len(points) >= 4 and points[0] == points[-1]
+    if closed:
+        ring = xy[:-1]
+        if len(ring) < 3:
+            return None
+
+        best = None
+        for index, start in enumerate(ring):
+            end = ring[(index + 1) % len(ring)]
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            length = math.hypot(dx, dy)
+            if best is None or length > best[0]:
+                best = (length, dx, dy)
+
+        if best is None or best[0] <= 0:
+            return None
+
+        length, dx, dy = best
+        ux = dx / length
+        uy = dy / length
+        px = -uy
+        py = ux
+        axis_values = [x * ux + y * uy for x, y in ring]
+        side_values = [x * px + y * py for x, y in ring]
+        axis_min = min(axis_values)
+        axis_max = max(axis_values)
+        side_center = (min(side_values) + max(side_values)) / 2.0
+        start_xy = (
+            ux * axis_min + px * side_center,
+            uy * axis_min + py * side_center,
+        )
+        end_xy = (
+            ux * axis_max + px * side_center,
+            uy * axis_max + py * side_center,
+        )
+    else:
+        start_xy = xy[0]
+        end_xy = xy[-1]
+
+    if math.hypot(end_xy[0] - start_xy[0], end_xy[1] - start_xy[1]) <= 0:
+        return None
+
+    return [
+        (
+            origin_lon + start_xy[0] / meters_per_lon,
+            origin_lat + start_xy[1] / meters_per_lat,
+        ),
+        (
+            origin_lon + end_xy[0] / meters_per_lon,
+            origin_lat + end_xy[1] / meters_per_lat,
+        ),
+    ]
+
+
+def runway_centerline_feature(feature):
+    points = runway_centerline_points(feature)
+    if points is None:
+        return None
+    return {
+        "label": feature.get("label") or "",
+        "points": points,
+        "width_m": feature.get("width_m") or 45.0,
+    }
+
+
+def runway_area_polygon(feature):
+    points = runway_centerline_points(feature)
+    if points is None or len(points) < 2:
+        return None
+
+    lon1, lat1 = points[0]
+    lon2, lat2 = points[-1]
+    mean_lat = (lat1 + lat2) / 2.0
+    meters_per_lat = 111320.0
+    meters_per_lon = max(1.0, meters_per_lat * math.cos(math.radians(mean_lat)))
+    dx = (lon2 - lon1) * meters_per_lon
+    dy = (lat2 - lat1) * meters_per_lat
+    length = math.hypot(dx, dy)
+    if length <= 0:
+        return None
+
+    width_m = max(
+        float(feature.get("width_m") or 45.0),
+        TASK_MAP_RUNWAY_VISIBLE_WIDTH_M,
+    )
+    half_width = width_m / 2.0
+    ux = -dy / length
+    uy = dx / length
+    dlon = ux * half_width / meters_per_lon
+    dlat = uy * half_width / meters_per_lat
+
+    polygon = [
+        (lon1 + dlon, lat1 + dlat),
+        (lon2 + dlon, lat2 + dlat),
+        (lon2 - dlon, lat2 - dlat),
+        (lon1 - dlon, lat1 - dlat),
+        (lon1 + dlon, lat1 + dlat),
+    ]
+    return {"label": feature.get("label") or "", "points": polygon}
+
+
+def runway_polygon_layers(features):
+    polygons = []
+    for feature in features or ():
+        polygon = runway_area_polygon(feature)
+        if polygon is not None:
+            polygons.append(polygon)
+
+    if not polygons:
+        return {}
+
+    return {"runway_area": polygons}
+
+
+def runway_polyline_layers(features):
+    centerlines = []
+    for feature in features or ():
+        centerline = runway_centerline_feature(feature)
+        if centerline is not None:
+            centerlines.append(centerline)
+
+    if not centerlines:
+        return {}
+    return {
+        "runway_casing_line": centerlines,
+        "runway_line": centerlines,
+    }
+
+
+def validate_bbox(bbox):
+    if bbox["south"] >= bbox["north"]:
+        raise ValueError("bbox.south must be less than bbox.north")
+    if bbox["west"] >= bbox["east"]:
+        raise ValueError("bbox.west must be less than bbox.east")
+    if bbox["south"] < -90 or bbox["north"] > 90:
+        raise ValueError("bbox latitude values must be within -90..90")
+
+
+def bbox_contains(outer, inner) -> bool:
+    epsilon = 1e-9
+    return (
+        outer["south"] <= inner["south"] + epsilon
+        and outer["west"] <= inner["west"] + epsilon
+        and outer["north"] >= inner["north"] - epsilon
+        and outer["east"] >= inner["east"] - epsilon
+    )
+
+
+def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
+    for base_map in base_maps:
+        if bbox_contains(base_map.bbox, bbox):
+            return base_map
+
+    formatted = (
+        f"{bbox['south']:.6f},{bbox['west']:.6f},"
+        f"{bbox['north']:.6f},{bbox['east']:.6f}"
+    )
+    raise ValueError(f"no base map covers requested bbox {formatted}")
+
+
+# ---------------------------------------------------------------------------
+# Mapgen fallback — generates a new XCM from scratch when no base map covers
+# the requested bbox.  Uses the XCSoar Map Generator running on the same host.
+# ---------------------------------------------------------------------------
+
+MAPGEN_URL = os.environ.get(
+    "KIGO_MAPGEN_URL", "http://172.17.0.1:9091"
+)
+MAPGEN_TIMEOUT_S = int(os.environ.get("KIGO_MAPGEN_TIMEOUT_S", "540"))
+MAPGEN_POLL_S = float(os.environ.get("KIGO_MAPGEN_POLL_S", "10"))
+
+
+class _StopRedirect(urllib.request.HTTPRedirectHandler):
+    """Raise HTTPError on any redirect so we can capture the Location header."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _mapgen_submit(bbox, name):
+    """POST to mapgen and return job UUID.  Raises on failure."""
+    form = {
+        "name": (name or "task_map")[:80],
+        "mail": "",
+        "high_quality": "on",      # 1 arc-second, level-of-detail 4
+        "welt2000": "on",          # airport / airstrip waypoints
+        "omit_path_track_lines": "on",  # exclude clutter paths & tracks
+        "selection": "bounds",
+        "left":   f"{bbox['west']:.6f}",
+        "right":  f"{bbox['east']:.6f}",
+        "top":    f"{bbox['north']:.6f}",
+        "bottom": f"{bbox['south']:.6f}",
+    }
+    body = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(
+        MAPGEN_URL + "/",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    opener = urllib.request.build_opener(_StopRedirect())
+    try:
+        opener.open(req, timeout=30)
+        raise RuntimeError("mapgen did not redirect after job submission")
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            raise
+        location = exc.headers.get("Location", "")
+    # Location is e.g. "/status?uuid=abc123"
+    if "uuid=" not in location:
+        raise RuntimeError(f"unexpected mapgen redirect: {location!r}")
+    return location.split("uuid=", 1)[1].strip()
+
+
+def _mapgen_poll(uuid, timeout_s):
+    """Poll mapgen /status until 'done', 'error', or timeout."""
+    deadline = time.monotonic() + timeout_s
+    url = f"{MAPGEN_URL}/status?uuid={uuid}"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+            if "is ready to download" in html:
+                return "done"
+            if "Generation failed" in html or "<title>Error" in html:
+                return "error"
+        except Exception:
+            pass
+        time.sleep(MAPGEN_POLL_S)
+    return "timeout"
+
+
+def _xcm_has_terrain(xcm_bytes):
+    """Return True if the XCM (bytes) contains a terrain.jp2 file."""
+    try:
+        import io
+        with zipfile.ZipFile(io.BytesIO(xcm_bytes)) as zf:
+            return "terrain.jp2" in zf.namelist()
+    except Exception:
+        return False
+
+
+def generate_map_from_mapgen(bbox, name, runway_features=None, corridor_segments=None, corridor_margin_km=0.0):
+    """Generate a new XCM map via mapgen, inject runways, return bytes or None."""
+    try:
+        uuid = _mapgen_submit(bbox, name)
+    except Exception as exc:
+        print(f"[mapgen] submit failed: {exc}", file=sys.stderr, flush=True)
+        return None, f"mapgen submit error: {exc}"
+
+    print(
+        f"[mapgen] submitted uuid={uuid} bbox={bbox['south']:.4f},"
+        f"{bbox['west']:.4f},{bbox['north']:.4f},{bbox['east']:.4f}",
+        file=sys.stderr, flush=True,
+    )
+
+    status = _mapgen_poll(uuid, MAPGEN_TIMEOUT_S)
+    if status != "done":
+        print(f"[mapgen] job {uuid} ended: {status}", file=sys.stderr, flush=True)
+        return None, f"mapgen {status}"
+
+    # Download the generated XCM
+    try:
+        with urllib.request.urlopen(
+            f"{MAPGEN_URL}/download?uuid={uuid}", timeout=120
+        ) as resp:
+            raw = resp.read()
+    except Exception as exc:
+        print(f"[mapgen] download failed {uuid}: {exc}", file=sys.stderr, flush=True)
+        return None, f"mapgen download error: {exc}"
+
+    # Optionally inject runway polygons and apply corridor filtering — only
+    # when the generated XCM has terrain (terrain-less maps can't be re-cropped).
+    if _xcm_has_terrain(raw) and (runway_features or (corridor_segments and corridor_margin_km > 0)):
+        try:
+            with tempfile.TemporaryDirectory(prefix="kigo_mapgen_rw_") as tmp:
+                src = Path(tmp) / "base.xcm"
+                dst = Path(tmp) / "out.xcm"
+                src.write_bytes(raw)
+                crop.crop_xcm_to_bbox(
+                    src, bbox, dst,
+                    excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
+                    forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
+                    extra_polyline_layers=runway_polyline_layers(runway_features),
+                    extra_polygon_layers=runway_polygon_layers(runway_features),
+                    corridor_segments=corridor_segments,
+                    corridor_margin_km=corridor_margin_km,
+                )
+                raw = dst.read_bytes()
+        except Exception as exc:
+            print(
+                f"[mapgen] runway injection failed (returning plain map): {exc}",
+                file=sys.stderr, flush=True,
+            )
+
+    print(f"[mapgen] done uuid={uuid} bytes={len(raw)}", file=sys.stderr, flush=True)
+    return raw, ""
+
+
+class TaskMapHandler(BaseHTTPRequestHandler):
+    server_version = "KigoTaskMapHTTP/1.0"
+    base_maps: tuple[BaseMap, ...]
+
+    def send_text(self, status: int, message: str):
+        body = (message.rstrip() + "\n").encode("utf-8", errors="replace")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_text(200, "ok")
+        else:
+            self.send_text(404, "not found")
+
+    def do_POST(self):
+        if self.path != "/api/task-map":
+            self.send_text(404, "not found")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_text(400, "invalid Content-Length")
+            return
+
+        if length <= 0 or length > 1024 * 1024:
+            self.send_text(413, "invalid request size")
+            return
+
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be a JSON object")
+            bbox, corridor_segments = bbox_and_segments_from_payload(payload)
+            validate_bbox(bbox)
+        except Exception as exc:
+            self.send_text(400, f"bad task map request: {exc}")
+            return
+
+        try:
+            runway_features, runway_error, runway_source = fetch_osm_runways(bbox)
+        except Exception as exc:
+            runway_features = []
+            runway_error = str(exc)
+            runway_source = "none"
+
+        # --- Try crop from existing base map ---
+        base_map = None
+        data = None
+        map_source = "crop"
+        mapgen_error = ""
+        try:
+            base_map = select_base_map(self.base_maps, bbox)
+        except ValueError:
+            pass  # No base map covers this bbox — will fall back to mapgen
+
+        if base_map is not None:
+            try:
+                with tempfile.TemporaryDirectory(prefix="kigo_task_map_http_") as tmp:
+                    output = Path(tmp) / "task_map_30km.xcm"
+                    crop.crop_xcm_to_bbox(
+                        base_map.path,
+                        bbox,
+                        output,
+                        excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
+                        forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
+                        extra_polyline_layers=runway_polyline_layers(runway_features),
+                        extra_polygon_layers=runway_polygon_layers(runway_features),
+                        corridor_segments=corridor_segments,
+                        corridor_margin_km=TASK_MAP_MARGIN_KM,
+                    )
+                    data = output.read_bytes()
+            except Exception as exc:
+                base_map = None
+                data = None
+                mapgen_error = str(exc)
+
+        # --- Fallback: generate from scratch via mapgen ---
+        if data is None:
+            task_name = str(payload.get("task_name") or "task_map")
+            data, mapgen_error = generate_map_from_mapgen(
+                bbox,
+                f"{task_name}_gen",
+                runway_features=runway_features,
+                corridor_segments=corridor_segments,
+                corridor_margin_km=TASK_MAP_MARGIN_KM,
+            )
+            map_source = "mapgen"
+            if data is None:
+                self.send_text(
+                    500,
+                    f"task map failed: no base map and mapgen error: {mapgen_error}",
+                )
+                return
+
+        bbox_header = (
+            f"{bbox['south']:.8f},{bbox['west']:.8f},"
+            f"{bbox['north']:.8f},{bbox['east']:.8f}"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", "attachment; filename=task_map_30km.xcm")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Kigo-Bbox", bbox_header)
+        self.send_header("X-Kigo-Base-Map",
+                         base_map.path.name if base_map else "mapgen")
+        self.send_header("X-Kigo-Map-Source", map_source)
+        self.send_header("X-Kigo-Task-Points", str(payload_point_count(payload)))
+        self.send_header("X-Kigo-Corridor-Segments", str(len(corridor_segments)))
+        self.send_header("X-Kigo-Runways", str(len(runway_features)))
+        self.send_header("X-Kigo-Runway-Source", runway_source)
+        if runway_error:
+            self.send_header("X-Kigo-Runway-Error", runway_error[:200])
+        if mapgen_error and map_source == "mapgen":
+            self.send_header("X-Kigo-Mapgen-Note", mapgen_error[:200])
+        self.end_headers()
+        self.wfile.write(data)
+        self.log_message(
+            "task-map generated task=%r source=%s points=%d runways=%d runway_source=%s runway_error=%r bbox=%s base=%s bytes=%d",
+            str(payload.get("task_name") or ""),
+            map_source,
+            payload_point_count(payload),
+            len(runway_features),
+            runway_source,
+            runway_error,
+            bbox_header,
+            base_map.path.name if base_map else "mapgen",
+            len(data),
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=os.environ.get("KIGO_TASK_MAP_HOST", "0.0.0.0"))
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("KIGO_TASK_MAP_PORT", "8787")),
+    )
+    parser.add_argument("--base-xcm", type=Path)
+    args = parser.parse_args()
+
+    TaskMapHandler.base_maps = find_base_maps(args.base_xcm)
+    server = ThreadingHTTPServer((args.host, args.port), TaskMapHandler)
+    print(
+        f"Kigo task map service listening on {args.host}:{args.port}; "
+        "bases=" + ", ".join(str(base.path) for base in TaskMapHandler.base_maps),
+        flush=True,
+    )
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

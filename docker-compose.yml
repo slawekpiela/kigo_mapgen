@@ -27,6 +27,22 @@ services:
       - mapgen-data:/opt/mapgen/data
       - ${MAPGEN_HIGH_QUALITY_DATA_DIR:-/home/slawek/mapgen-data-nowa_mapa2/repo}:/opt/mapgen/high-quality-data:ro
 
+  kigo-task-map:
+    build:
+      context: .
+      dockerfile: ./container/taskmap/Dockerfile
+    image: kigo-task-map
+    ports:
+      - "${KIGO_TASK_MAP_PORT:-8080}:8080"
+    volumes:
+      - ${KIGO_TASK_MAP_BASE_MAP_DIR:-/maps}:/maps:ro
+      - kigo-task-map-runways:/tmp/kigo_task_map_runways
+    environment:
+      - KIGO_MAPGEN_URL=${KIGO_MAPGEN_URL:-http://172.17.0.1:9091}
+      - KIGO_TASK_MAP_BASE_XCM=${KIGO_TASK_MAP_BASE_XCM:-}
+      - KIGO_TASK_MAP_RUNWAY_CACHE_DIR=/tmp/kigo_task_map_runways
+
 volumes:
   mapgen-data:
   mapgen-jobs:
+  kigo-task-map-runways:
