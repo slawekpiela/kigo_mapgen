@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """HTTP task-map service for Kigo remote map generation.
 
-The Pi/Kigo client posts task points and a historical bbox.  This service runs
-on anton, derives the authoritative 30 km task-point bbox from the posted
-points, crops the configured base XCM map, and returns the generated XCM file
-as the HTTP response body.
+The Pi/Kigo client posts the active task's extreme points and the 30 km padded
+bbox computed from them.  This service runs on anton, asks mapgen to generate a
+fresh high-quality Kigo map for that bbox, injects visible runway geometry, and
+returns the generated XCM file as the HTTP response body.
 """
 
 from __future__ import annotations
@@ -149,37 +149,49 @@ def task_map_margin_km(payload) -> float:
     return max(TASK_MAP_MARGIN_KM, margin)
 
 
+def bbox_from_dict(bbox_dict):
+    if not isinstance(bbox_dict, dict):
+        raise ValueError("bbox must be an object")
+
+    return {
+        "south": number(bbox_dict.get("south"), "bbox.south"),
+        "west": number(bbox_dict.get("west"), "bbox.west"),
+        "north": number(bbox_dict.get("north"), "bbox.north"),
+        "east": number(bbox_dict.get("east"), "bbox.east"),
+    }
+
+
+def task_points_from_payload(payload):
+    points = payload.get("points")
+    if not isinstance(points, list):
+        return []
+
+    crop_points = []
+    for index, point in enumerate(points):
+        if not isinstance(point, dict):
+            raise ValueError(f"points[{index}] must be an object")
+        name = str(point.get("name") or point.get("role") or f"TP{index + 1:03d}")
+        lat = number(point.get("lat"), f"points[{index}].lat")
+        lon = number(point.get("lon"), f"points[{index}].lon")
+        crop_points.append((name, lat, lon))
+
+    return crop_points
+
+
 def bbox_and_segments_from_payload(payload):
     """Return (bbox, corridor_segments) from payload.
 
-    corridor_segments is a list of ((lat1,lon1),(lat2,lon2)) pairs — one per
-    route leg — used to filter shapefile records to the true 30 km corridor
-    around the task polyline rather than its enclosing rectangle.
-    Returns (bbox, []) when only a bbox dict was supplied (no point list).
+    When a bbox is supplied, it is authoritative.  The posted points are kept
+    for audit/logging and for older clients that only send point lists.
     """
-    points = payload.get("points")
-    if isinstance(points, list) and len(points) >= 2:
-        crop_points = []
-        for index, point in enumerate(points):
-            if not isinstance(point, dict):
-                raise ValueError(f"points[{index}] must be an object")
-            name = str(point.get("name") or f"TP{index + 1:03d}")
-            lat = number(point.get("lat"), f"points[{index}].lat")
-            lon = number(point.get("lon"), f"points[{index}].lon")
-            crop_points.append((name, lat, lon))
-
-        bbox = crop.buffered_bbox(crop_points, task_map_margin_km(payload))
-        segments = crop.route_segments(crop_points)
-        return bbox, segments
-
     bbox_dict = payload.get("bbox")
     if isinstance(bbox_dict, dict):
-        return {
-            "south": number(bbox_dict.get("south"), "bbox.south"),
-            "west": number(bbox_dict.get("west"), "bbox.west"),
-            "north": number(bbox_dict.get("north"), "bbox.north"),
-            "east": number(bbox_dict.get("east"), "bbox.east"),
-        }, []
+        return bbox_from_dict(bbox_dict), []
+
+    crop_points = task_points_from_payload(payload)
+    if len(crop_points) >= 2:
+        bbox = crop.buffered_bbox(crop_points, task_map_margin_km(payload))
+        return bbox, crop.route_segments(crop_points)
 
     raise ValueError("payload must contain at least two points or bbox")
 
@@ -192,6 +204,28 @@ def bbox_from_payload(payload):
 def payload_point_count(payload) -> int:
     points = payload.get("points")
     return len(points) if isinstance(points, list) else 0
+
+
+def payload_points_summary(payload) -> str:
+    points = payload.get("points")
+    if not isinstance(points, list):
+        return ""
+
+    parts = []
+    for index, point in enumerate(points):
+        if not isinstance(point, dict):
+            parts.append(f"{index}:<invalid>")
+            continue
+        role = str(point.get("role") or index)
+        name = str(point.get("name") or "")
+        lat = point.get("lat")
+        lon = point.get("lon")
+        try:
+            parts.append(f"{role}:{name}@{float(lat):.8f},{float(lon):.8f}")
+        except (TypeError, ValueError):
+            parts.append(f"{role}:{name}@<invalid>")
+
+    return "; ".join(parts)
 
 
 def runway_label(tags) -> str:
@@ -705,7 +739,7 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
         return None, f"mapgen submit error: {exc}"
 
     print(
-        f"[mapgen] submitted uuid={uuid} bbox={bbox['south']:.4f},"
+        f"[mapgen] submitted name={name!r} uuid={uuid} bbox={bbox['south']:.4f},"
         f"{bbox['west']:.4f},{bbox['north']:.4f},{bbox['east']:.4f}",
         file=sys.stderr, flush=True,
     )
@@ -747,7 +781,7 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
                 file=sys.stderr, flush=True,
             )
 
-    print(f"[mapgen] done uuid={uuid} bytes={len(raw)}", file=sys.stderr, flush=True)
+    print(f"[mapgen] done name={name!r} uuid={uuid} bytes={len(raw)}", file=sys.stderr, flush=True)
     return raw, ""
 
 
@@ -790,9 +824,24 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                 raise ValueError("payload must be a JSON object")
             bbox = bbox_from_payload(payload)
             validate_bbox(bbox)
+            task_points = task_points_from_payload(payload)
         except Exception as exc:
             self.send_text(400, f"bad task map request: {exc}")
             return
+
+        bbox_header = (
+            f"{bbox['south']:.8f},{bbox['west']:.8f},"
+            f"{bbox['north']:.8f},{bbox['east']:.8f}"
+        )
+        task_name = str(payload.get("task_name") or "task_map")
+        map_name = f"{task_name}_gen"
+        self.log_message(
+            "task-map request task=%r map_name=%r bbox=%s points=%s",
+            task_name,
+            map_name,
+            bbox_header,
+            payload_points_summary(payload),
+        )
 
         try:
             runway_features, runway_error, runway_source = fetch_osm_runways(bbox)
@@ -801,20 +850,15 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             runway_error = str(exc)
             runway_source = "none"
 
-        task_name = str(payload.get("task_name") or "task_map")
         data, mapgen_error = generate_map_from_mapgen(
             bbox,
-            f"{task_name}_gen",
+            map_name,
             runway_features=runway_features,
         )
         if data is None:
             self.send_text(500, f"task map failed: {mapgen_error}")
             return
 
-        bbox_header = (
-            f"{bbox['south']:.8f},{bbox['west']:.8f},"
-            f"{bbox['north']:.8f},{bbox['east']:.8f}"
-        )
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Disposition", "attachment; filename=task_map_30km.xcm")
@@ -822,6 +866,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         self.send_header("X-Kigo-Bbox", bbox_header)
         self.send_header("X-Kigo-Base-Map", "mapgen")
         self.send_header("X-Kigo-Map-Source", "mapgen")
+        self.send_header("X-Kigo-Map-Name", map_name)
         self.send_header("X-Kigo-Task-Points", str(payload_point_count(payload)))
         self.send_header("X-Kigo-Runways", str(len(runway_features)))
         self.send_header("X-Kigo-Runway-Source", runway_source)
@@ -830,9 +875,10 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
         self.log_message(
-            "task-map generated task=%r source=mapgen points=%d runways=%d runway_source=%s runway_error=%r bbox=%s bytes=%d",
-            str(payload.get("task_name") or ""),
-            payload_point_count(payload),
+            "task-map generated task=%r map_name=%r source=mapgen points=%d runways=%d runway_source=%s runway_error=%r bbox=%s bytes=%d",
+            task_name,
+            map_name,
+            len(task_points),
             len(runway_features),
             runway_source,
             runway_error,
