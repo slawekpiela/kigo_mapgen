@@ -2,14 +2,12 @@
 import os
 import sys
 import time
-import smtplib
 import traceback
 import shutil
 from contextlib import contextmanager
 from xcsoar.mapgen.server.job import Job
 from xcsoar.mapgen.generator import Generator
 from xcsoar.mapgen.util import check_commands
-from xcsoar.mapgen.server.config import mapgen
 
 
 DEFAULT_ESTIMATED_POWER_WATTS = 25.0
@@ -20,7 +18,6 @@ class Worker:
         check_commands()
         self.__dir_jobs = os.path.abspath(dir_jobs)
         self.__dir_data = os.path.abspath(dir_data)
-        self.__mail_server = mail_server
         self.__estimated_power_watts = self.__read_estimated_power_watts()
         self.__run = False
 
@@ -86,33 +83,6 @@ class Worker:
             )
         except Exception as e:
             print(("Failed to log job metrics: {}".format(e)))
-
-    def __send_download_mail(self, job):
-        try:
-            print(("Sending download mail to {} ...".format(job.description.mail)))
-
-            msg = """From: no-reply@xcsoar.org"
-To: {to}
-Subject: XCSoar Map Generator - Download ready ({name}.xcm)
-
-The XCSoar Map Generator has finished your map: {name}
-It can be downloaded at {protocol}://{domain}{url}
-This link is valid for 7 days.
-""".format(
-                to=job.description.mail,
-                name=job.description.name,
-                protocol=mapgen["protocol"],
-                domain=mapgen["domain"],
-                url=job.description.download_url,
-            )
-
-            s = smtplib.SMTP(self.__mail_server)
-            try:
-                s.sendmail("no-reply@xcsoar.org", job.description.mail, msg)
-            finally:
-                s.quit()
-        except Exception as e:
-            print(("Failed to send mail: {}".format(e)))
 
     @contextmanager
     def __high_quality_data_environment(self):
@@ -256,7 +226,12 @@ This link is valid for 7 days.
 
         print(("Map {} is ready for use.".format(job.map_file())))
         if job.description.mail != "":
-            self.__send_download_mail(job)
+            print(
+                (
+                    "Download mail disabled; not sending notification to {}."
+                    .format(job.description.mail)
+                )
+            )
 
     def run(self):
         self.__run = True
