@@ -91,6 +91,9 @@ TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
 TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v6"
+TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
+    os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
+)
 TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "3000"))
 TASK_MAP_LABEL_POINT_LAYERS = tuple(
     layer.strip()
@@ -1115,6 +1118,12 @@ def find_covering_cached_xcm(required_bbox, source_key: str):
         return None
 
     candidates = []
+    required_area = bbox_area_key(required_bbox)
+    max_area = (
+        required_area * TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO
+        if required_area > 0
+        else 0.0
+    )
     for meta_path in TASK_MAP_XCM_CACHE_DIR.glob("*.json"):
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1123,10 +1132,13 @@ def find_covering_cached_xcm(required_bbox, source_key: str):
             cached_bbox = metadata.get("bbox")
             if not isinstance(cached_bbox, dict) or not bbox_contains(cached_bbox, required_bbox):
                 continue
+            cached_area = bbox_area_key(cached_bbox)
+            if required_area > 0 and cached_area > max_area:
+                continue
             xcm_path = TASK_MAP_XCM_CACHE_DIR / f"{meta_path.stem}.xcm"
             if not xcm_path.exists():
                 continue
-            candidates.append((bbox_area_key(cached_bbox), xcm_path, metadata))
+            candidates.append((cached_area, xcm_path, metadata))
         except Exception:
             continue
 
