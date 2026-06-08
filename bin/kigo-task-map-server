@@ -90,7 +90,7 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v2"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v3"
 TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "5000"))
 TASK_MAP_LABEL_POINT_LAYERS = ("city_point", "town_point", "village_point", "suburb_point")
 TASK_MAP_LABEL_LAYER_PRIORITY = {
@@ -99,6 +99,14 @@ TASK_MAP_LABEL_LAYER_PRIORITY = {
     "village_point": 2,
     "suburb_point": 3,
 }
+TASK_MAP_SUPPRESSED_NAME_LAYERS = tuple(
+    layer.strip()
+    for layer in os.environ.get(
+        "KIGO_TASK_MAP_SUPPRESSED_NAME_LAYERS",
+        "water_area_large,water_area_small,water_line,stream_line,city_area,forest_area",
+    ).split(",")
+    if layer.strip()
+)
 
 
 @dataclass(frozen=True)
@@ -806,8 +814,50 @@ def build_dbf_bytes(dbf: bytes, keep_indices):
     return bytes(header) + rest_header + b"".join(selected) + b"\x1a"
 
 
+def blank_dbf_name_fields(dbf: bytes):
+    if len(dbf) < 32:
+        return dbf, 0
+
+    fields, header_len, record_len, _ = dbf_field_specs(dbf)
+    if not fields or record_len <= 0:
+        return dbf, 0
+
+    targets = []
+    position = 1
+    for name, length in fields:
+        if name.lower() == "name":
+            targets.append((position, length))
+        position += length
+
+    if not targets:
+        return dbf, 0
+
+    out = bytearray(dbf)
+    count = struct.unpack_from("<I", dbf, 4)[0]
+    changed = 0
+    for index in range(count):
+        start = header_len + index * record_len
+        end = start + record_len
+        if end > len(out):
+            break
+        if out[start:start + 1] == b"*":
+            continue
+
+        changed_row = False
+        for offset, length in targets:
+            field_start = start + offset
+            field_end = field_start + length
+            if bytes(out[field_start:field_end]).strip():
+                out[field_start:field_end] = b" " * length
+                changed_row = True
+        if changed_row:
+            changed += 1
+
+    return bytes(out), changed
+
+
 def rewrite_xcm_with_thinned_labels(xcm_bytes: bytes):
-    if TASK_MAP_LABEL_SPACING_M <= 0:
+    if TASK_MAP_LABEL_SPACING_M <= 0 and not TASK_MAP_SUPPRESSED_NAME_LAYERS:
         return xcm_bytes, {}
 
     with tempfile.TemporaryDirectory(prefix="kigo_label_thin_") as tmp:
@@ -830,35 +880,52 @@ def rewrite_xcm_with_thinned_labels(xcm_bytes: bytes):
                     "shx": zin.read(f"{layer_name}.shx"),
                 }
 
-            if not layer_payloads:
-                return xcm_bytes, {}
-
-            keep, total, removed = thin_label_point_layers(
-                layer_payloads,
-                TASK_MAP_LABEL_SPACING_M,
-            )
-            if removed <= 0:
-                return xcm_bytes, {"total": total, "removed": 0}
-
             replacements = {}
             changed_layers = set()
-            stats = {"total": total, "removed": removed, "layers": {}}
-            for layer_name, payload in layer_payloads.items():
-                keep_indices = keep.get(layer_name, set())
-                records = [
-                    record
-                    for index, record in enumerate(payload["records"])
-                    if index in keep_indices
-                ]
-                before = len(payload["records"])
-                after = len(records)
-                if before == after:
+            stats = {}
+
+            if layer_payloads and TASK_MAP_LABEL_SPACING_M > 0:
+                keep, total, removed = thin_label_point_layers(
+                    layer_payloads,
+                    TASK_MAP_LABEL_SPACING_M,
+                )
+                stats.update({"total": total, "removed": removed, "layers": {}})
+                for layer_name, payload in layer_payloads.items():
+                    keep_indices = keep.get(layer_name, set())
+                    records = [
+                        record
+                        for index, record in enumerate(payload["records"])
+                        if index in keep_indices
+                    ]
+                    before = len(payload["records"])
+                    after = len(records)
+                    if before == after:
+                        continue
+                    changed_layers.add(layer_name)
+                    stats["layers"][layer_name] = {"before": before, "after": after}
+                    replacements[f"{layer_name}.shp"] = build_shp_bytes(payload["header"], records)
+                    replacements[f"{layer_name}.shx"] = build_shx_bytes(payload["header"], records)
+                    replacements[f"{layer_name}.dbf"] = build_dbf_bytes(payload["dbf"], keep_indices)
+
+            suppressed = {}
+            for layer_name in TASK_MAP_SUPPRESSED_NAME_LAYERS:
+                dbf_name = f"{layer_name}.dbf"
+                if dbf_name not in names:
                     continue
-                changed_layers.add(layer_name)
-                stats["layers"][layer_name] = {"before": before, "after": after}
-                replacements[f"{layer_name}.shp"] = build_shp_bytes(payload["header"], records)
-                replacements[f"{layer_name}.shx"] = build_shx_bytes(payload["header"], records)
-                replacements[f"{layer_name}.dbf"] = build_dbf_bytes(payload["dbf"], keep_indices)
+                dbf = replacements.get(dbf_name)
+                if dbf is None:
+                    dbf = zin.read(dbf_name)
+                cleaned, changed = blank_dbf_name_fields(dbf)
+                if changed <= 0:
+                    continue
+                replacements[dbf_name] = cleaned
+                suppressed[layer_name] = changed
+
+            if suppressed:
+                stats["suppressed_names"] = suppressed
+
+            if not replacements:
+                return xcm_bytes, stats
 
             with zipfile.ZipFile(dst_path, "w", compression=zipfile.ZIP_STORED) as zout:
                 for info in zin.infolist():
