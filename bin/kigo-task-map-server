@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """HTTP task-map service for Kigo remote map generation.
 
-The Pi/Kigo client posts the active task's extreme points and the 30 km padded
-bbox computed from them.  This service runs on anton, asks mapgen to generate a
-fresh high-quality Kigo map for that bbox, injects visible runway geometry, and
-returns the generated XCM file as the HTTP response body.
+Kigo posts the active task's extreme points plus its requested bbox.  The
+service first tries a ready XCM cache whose map still leaves the route at least
+20 km from the edge, then builds and caches a high-quality tile-union XCM when
+the task fits in a small source-tile set, and finally falls back to an exact
+bbox mapgen request.
 """
 
 from __future__ import annotations
@@ -75,6 +76,19 @@ TASK_MAP_OVERPASS_ATTEMPTS = int(os.environ.get("KIGO_TASK_MAP_OVERPASS_ATTEMPTS
 TASK_MAP_RUNWAY_CACHE_DIR = Path(
     os.environ.get("KIGO_TASK_MAP_RUNWAY_CACHE_DIR", "/tmp/kigo_task_map_runways")
 )
+TASK_MAP_XCM_CACHE_DIR = Path(
+    os.environ.get("KIGO_TASK_MAP_XCM_CACHE_DIR", "/tmp/kigo_task_map_xcm_cache")
+)
+TASK_MAP_SOURCE_REPO = Path(
+    os.environ.get("KIGO_TASK_MAP_SOURCE_REPO", "/opt/mapgen/high-quality-data")
+)
+TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
+    os.environ.get("KIGO_TASK_MAP_ROUTE_TILE_MARGIN_KM", "20")
+)
+TASK_MAP_TILE_CACHE_MAX_TILES = int(
+    os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
+)
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v1"
 
 
 @dataclass(frozen=True)
@@ -82,6 +96,12 @@ class BaseMap:
     path: Path
     bbox: dict[str, float]           # terrain coverage
     topology_bbox: "dict | None"     # topology coverage, None = no shapefile data
+
+
+@dataclass(frozen=True)
+class SourceTile:
+    name: str
+    bbox: dict[str, float]
 
 
 def xcm_terrain_bbox(xcm: Path):
@@ -199,6 +219,12 @@ def bbox_and_segments_from_payload(payload):
 def bbox_from_payload(payload):
     bbox, _ = bbox_and_segments_from_payload(payload)
     return bbox
+
+
+def route_cache_bbox(payload, request_bbox, task_points):
+    if len(task_points) >= 2:
+        return crop.buffered_bbox(task_points, TASK_MAP_ROUTE_TILE_MARGIN_KM)
+    return request_bbox
 
 
 def payload_point_count(payload) -> int:
@@ -628,6 +654,38 @@ def bbox_contains(outer, inner) -> bool:
     )
 
 
+def bbox_intersects(a, b) -> bool:
+    return not (
+        a["east"] < b["west"]
+        or a["west"] > b["east"]
+        or a["north"] < b["south"]
+        or a["south"] > b["north"]
+    )
+
+
+def bbox_union(boxes):
+    boxes = list(boxes)
+    if not boxes:
+        return None
+    return {
+        "south": min(box["south"] for box in boxes),
+        "west": min(box["west"] for box in boxes),
+        "north": max(box["north"] for box in boxes),
+        "east": max(box["east"] for box in boxes),
+    }
+
+
+def bbox_area_key(bbox):
+    return max(0.0, bbox["north"] - bbox["south"]) * max(0.0, bbox["east"] - bbox["west"])
+
+
+def bbox_header_text(bbox) -> str:
+    return (
+        f"{bbox['south']:.8f},{bbox['west']:.8f},"
+        f"{bbox['north']:.8f},{bbox['east']:.8f}"
+    )
+
+
 def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
     for base_map in base_maps:
         if not bbox_contains(base_map.bbox, bbox):
@@ -647,6 +705,151 @@ def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
         f"{bbox['north']:.6f},{bbox['east']:.6f}"
     )
     raise ValueError(f"no base map covers requested bbox {formatted}")
+
+
+def load_source_tiles() -> tuple[SourceTile, ...]:
+    manifest_path = TASK_MAP_SOURCE_REPO / "manifest"
+    if not manifest_path.exists():
+        return ()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    datasets = manifest.get("topology", {}).get("datasets", {}).get("osm", [])
+    tiles = []
+    for dataset in datasets:
+        name = str(dataset.get("name") or "")
+        bounds = dataset.get("bounds")
+        if not name or not isinstance(bounds, list) or len(bounds) != 4:
+            continue
+        left, right, top, bottom = (float(value) for value in bounds)
+        tiles.append(
+            SourceTile(
+                name=name,
+                bbox={"south": bottom, "west": left, "north": top, "east": right},
+            )
+        )
+    return tuple(tiles)
+
+
+def source_repo_fingerprint() -> str:
+    digest = hashlib.sha1()
+    digest.update(TASK_MAP_XCM_CACHE_VERSION.encode("ascii"))
+    for name in ("manifest", "checksums"):
+        path = TASK_MAP_SOURCE_REPO / name
+        if not path.exists():
+            digest.update(f"{name}:missing".encode("ascii"))
+            continue
+        digest.update(name.encode("ascii"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def select_source_tile_cache(required_bbox):
+    tiles = load_source_tiles()
+    if not tiles:
+        return None
+
+    selected = [tile for tile in tiles if bbox_intersects(tile.bbox, required_bbox)]
+    if not selected:
+        return None
+
+    union = bbox_union(tile.bbox for tile in selected)
+    if union is None or not bbox_contains(union, required_bbox):
+        return None
+    if len(selected) > TASK_MAP_TILE_CACHE_MAX_TILES:
+        return None
+    return tuple(sorted(selected, key=lambda tile: tile.name)), union
+
+
+def xcm_cache_digest(kind: str, source_key: str, bbox, tile_names=()) -> str:
+    payload = {
+        "version": TASK_MAP_XCM_CACHE_VERSION,
+        "kind": kind,
+        "source_key": source_key,
+        "bbox": {key: round(float(value), 8) for key, value in sorted(bbox.items())},
+        "tiles": list(tile_names),
+        "runway_width_m": TASK_MAP_RUNWAY_VISIBLE_WIDTH_M,
+    }
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def xcm_cache_paths(cache_key: str):
+    return (
+        TASK_MAP_XCM_CACHE_DIR / f"{cache_key}.xcm",
+        TASK_MAP_XCM_CACHE_DIR / f"{cache_key}.json",
+    )
+
+
+def read_cached_xcm(cache_key: str):
+    xcm_path, meta_path = xcm_cache_paths(cache_key)
+    if not xcm_path.exists() or not meta_path.exists():
+        return None
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        return xcm_path.read_bytes(), metadata, xcm_path
+    except Exception:
+        return None
+
+
+def find_covering_cached_xcm(required_bbox, source_key: str):
+    if not TASK_MAP_XCM_CACHE_DIR.exists():
+        return None
+
+    candidates = []
+    for meta_path in TASK_MAP_XCM_CACHE_DIR.glob("*.json"):
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            if metadata.get("source_key") != source_key:
+                continue
+            cached_bbox = metadata.get("bbox")
+            if not isinstance(cached_bbox, dict) or not bbox_contains(cached_bbox, required_bbox):
+                continue
+            xcm_path = TASK_MAP_XCM_CACHE_DIR / f"{meta_path.stem}.xcm"
+            if not xcm_path.exists():
+                continue
+            candidates.append((bbox_area_key(cached_bbox), xcm_path, metadata))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    _, xcm_path, metadata = min(candidates, key=lambda item: item[0])
+    try:
+        return xcm_path.read_bytes(), metadata, xcm_path
+    except Exception:
+        return None
+
+
+def save_cached_xcm(cache_key: str, data: bytes, metadata: dict) -> None:
+    TASK_MAP_XCM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    xcm_path, meta_path = xcm_cache_paths(cache_key)
+    tmp_xcm = xcm_path.with_suffix(".xcm.tmp")
+    tmp_meta = meta_path.with_suffix(".json.tmp")
+    tmp_xcm.write_bytes(data)
+    tmp_meta.write_text(
+        json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp_xcm, xcm_path)
+    os.replace(tmp_meta, meta_path)
+
+
+def build_cache_metadata(kind: str, source_key: str, bbox, request_bbox,
+                         required_bbox, tile_names, bytes_count: int,
+                         runway_count: int, runway_source: str):
+    return {
+        "version": TASK_MAP_XCM_CACHE_VERSION,
+        "kind": kind,
+        "source_key": source_key,
+        "bbox": bbox,
+        "request_bbox": request_bbox,
+        "required_bbox": required_bbox,
+        "tiles": list(tile_names),
+        "bytes": bytes_count,
+        "runways": runway_count,
+        "runway_source": runway_source,
+        "created_epoch": time.time(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +1000,45 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_xcm(self, data: bytes, *, bbox, task_name: str, map_name: str,
+                 task_points, runway_features, runway_source: str,
+                 runway_error: str, map_source: str, cache_status: str,
+                 cache_key: str = "", tile_names=()):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", "attachment; filename=task_map_30km.xcm")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Kigo-Bbox", bbox_header_text(bbox))
+        self.send_header("X-Kigo-Base-Map", map_source)
+        self.send_header("X-Kigo-Map-Source", map_source)
+        self.send_header("X-Kigo-Map-Name", map_name)
+        self.send_header("X-Kigo-Task-Points", str(len(task_points)))
+        self.send_header("X-Kigo-Runways", str(len(runway_features or ())))
+        self.send_header("X-Kigo-Runway-Source", runway_source)
+        self.send_header("X-Kigo-Cache", cache_status)
+        if cache_key:
+            self.send_header("X-Kigo-Cache-Key", cache_key[:40])
+        if tile_names:
+            self.send_header("X-Kigo-Source-Tiles", ",".join(tile_names))
+        if runway_error:
+            self.send_header("X-Kigo-Runway-Error", runway_error[:200])
+        self.end_headers()
+        self.wfile.write(data)
+        self.log_message(
+            "task-map generated task=%r map_name=%r source=%s cache=%s points=%d runways=%d runway_source=%s runway_error=%r bbox=%s bytes=%d tiles=%s",
+            task_name,
+            map_name,
+            map_source,
+            cache_status,
+            len(task_points),
+            len(runway_features or ()),
+            runway_source,
+            runway_error,
+            bbox_header_text(bbox),
+            len(data),
+            ",".join(tile_names),
+        )
+
     def do_GET(self):
         if self.path == "/health":
             self.send_text(200, "ok")
@@ -825,23 +1067,136 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             bbox = bbox_from_payload(payload)
             validate_bbox(bbox)
             task_points = task_points_from_payload(payload)
+            required_bbox = route_cache_bbox(payload, bbox, task_points)
+            validate_bbox(required_bbox)
         except Exception as exc:
             self.send_text(400, f"bad task map request: {exc}")
             return
 
-        bbox_header = (
-            f"{bbox['south']:.8f},{bbox['west']:.8f},"
-            f"{bbox['north']:.8f},{bbox['east']:.8f}"
-        )
+        bbox_header = bbox_header_text(bbox)
         task_name = str(payload.get("task_name") or "task_map")
         map_name = f"{task_name}_gen"
         self.log_message(
-            "task-map request task=%r map_name=%r bbox=%s points=%s",
+            "task-map request task=%r map_name=%r bbox=%s required_bbox=%s points=%s",
             task_name,
             map_name,
             bbox_header,
+            bbox_header_text(required_bbox),
             payload_points_summary(payload),
         )
+
+        source_key = source_repo_fingerprint()
+        cached = find_covering_cached_xcm(required_bbox, source_key)
+        if cached is not None:
+            data, metadata, _ = cached
+            cached_bbox = metadata.get("bbox") if isinstance(metadata.get("bbox"), dict) else bbox
+            self.send_xcm(
+                data,
+                bbox=cached_bbox,
+                task_name=task_name,
+                map_name=map_name,
+                task_points=task_points,
+                runway_features=[None] * int(metadata.get("runways") or 0),
+                runway_source=str(metadata.get("runway_source") or "cache"),
+                runway_error="",
+                map_source="xcm-cache",
+                cache_status="hit",
+                cache_key=str(metadata.get("cache_key") or ""),
+                tile_names=metadata.get("tiles") or (),
+            )
+            return
+
+        tile_cache = select_source_tile_cache(required_bbox)
+        if tile_cache is not None:
+            tiles, cache_bbox = tile_cache
+            tile_names = tuple(tile.name for tile in tiles)
+            cache_key = xcm_cache_digest("source-tiles", source_key, cache_bbox, tile_names)
+            cached = read_cached_xcm(cache_key)
+            if cached is not None:
+                data, metadata, _ = cached
+                self.send_xcm(
+                    data,
+                    bbox=cache_bbox,
+                    task_name=task_name,
+                    map_name=map_name,
+                    task_points=task_points,
+                    runway_features=[None] * int(metadata.get("runways") or 0),
+                    runway_source=str(metadata.get("runway_source") or "cache"),
+                    runway_error="",
+                    map_source="xcm-cache",
+                    cache_status="hit",
+                    cache_key=cache_key,
+                    tile_names=tile_names,
+                )
+                return
+
+            try:
+                runway_features, runway_error, runway_source = fetch_osm_runways(cache_bbox)
+            except Exception as exc:
+                runway_features = []
+                runway_error = str(exc)
+                runway_source = "none"
+
+            data, mapgen_error = generate_map_from_mapgen(
+                cache_bbox,
+                "tiles_" + "_".join(name.rsplit("/", 1)[-1] for name in tile_names),
+                runway_features=runway_features,
+            )
+            if data is None:
+                self.log_message(
+                    "tile-cache generation failed task=%r tiles=%s error=%r; falling back to exact bbox",
+                    task_name,
+                    ",".join(tile_names),
+                    mapgen_error,
+                )
+            else:
+                metadata = build_cache_metadata(
+                    "source-tiles",
+                    source_key,
+                    cache_bbox,
+                    bbox,
+                    required_bbox,
+                    tile_names,
+                    len(data),
+                    len(runway_features),
+                    runway_source,
+                )
+                metadata["cache_key"] = cache_key
+                save_cached_xcm(cache_key, data, metadata)
+                self.send_xcm(
+                    data,
+                    bbox=cache_bbox,
+                    task_name=task_name,
+                    map_name=map_name,
+                    task_points=task_points,
+                    runway_features=runway_features,
+                    runway_source=runway_source,
+                    runway_error=runway_error,
+                    map_source="mapgen-source-tiles",
+                    cache_status="miss-filled",
+                    cache_key=cache_key,
+                    tile_names=tile_names,
+                )
+                return
+
+        exact_key = xcm_cache_digest("exact-bbox", source_key, bbox)
+        cached = read_cached_xcm(exact_key)
+        if cached is not None:
+            data, metadata, _ = cached
+            self.send_xcm(
+                data,
+                bbox=bbox,
+                task_name=task_name,
+                map_name=map_name,
+                task_points=task_points,
+                runway_features=[None] * int(metadata.get("runways") or 0),
+                runway_source=str(metadata.get("runway_source") or "cache"),
+                runway_error="",
+                map_source="xcm-cache",
+                cache_status="exact-hit",
+                cache_key=exact_key,
+            )
+            return
 
         try:
             runway_features, runway_error, runway_source = fetch_osm_runways(bbox)
@@ -859,31 +1214,31 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             self.send_text(500, f"task map failed: {mapgen_error}")
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Disposition", "attachment; filename=task_map_30km.xcm")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-Kigo-Bbox", bbox_header)
-        self.send_header("X-Kigo-Base-Map", "mapgen")
-        self.send_header("X-Kigo-Map-Source", "mapgen")
-        self.send_header("X-Kigo-Map-Name", map_name)
-        self.send_header("X-Kigo-Task-Points", str(payload_point_count(payload)))
-        self.send_header("X-Kigo-Runways", str(len(runway_features)))
-        self.send_header("X-Kigo-Runway-Source", runway_source)
-        if runway_error:
-            self.send_header("X-Kigo-Runway-Error", runway_error[:200])
-        self.end_headers()
-        self.wfile.write(data)
-        self.log_message(
-            "task-map generated task=%r map_name=%r source=mapgen points=%d runways=%d runway_source=%s runway_error=%r bbox=%s bytes=%d",
-            task_name,
-            map_name,
-            len(task_points),
+        metadata = build_cache_metadata(
+            "exact-bbox",
+            source_key,
+            bbox,
+            bbox,
+            required_bbox,
+            (),
+            len(data),
             len(runway_features),
             runway_source,
-            runway_error,
-            bbox_header,
-            len(data),
+        )
+        metadata["cache_key"] = exact_key
+        save_cached_xcm(exact_key, data, metadata)
+        self.send_xcm(
+            data,
+            bbox=bbox,
+            task_name=task_name,
+            map_name=map_name,
+            task_points=task_points,
+            runway_features=runway_features,
+            runway_source=runway_source,
+            runway_error=runway_error,
+            map_source="mapgen",
+            cache_status="exact-miss-filled",
+            cache_key=exact_key,
         )
 
 

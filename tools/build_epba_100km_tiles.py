@@ -34,6 +34,9 @@ AREA_NLT = "MULTIPOLYGON"
 LINE_NLT = "MULTILINESTRING"
 POINT_NLT = "POINT"
 SHAPE_EXTENSIONS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
+POINT_SPACING_RULES_M = {
+    "village_point": 5_000.0,
+}
 
 
 @dataclass(frozen=True)
@@ -675,6 +678,115 @@ def dedupe_layer(dataset_dir: Path, layer_name: str) -> int:
     return skipped
 
 
+def feature_population(feature: ogr.Feature, layer_defn: ogr.FeatureDefn) -> int:
+    index = field_index(layer_defn, "population")
+    if index < 0 or not feature.IsFieldSetAndNotNull(index):
+        return 0
+    try:
+        return int(feature.GetField(index) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def copy_feature(feature: ogr.Feature, source_defn: ogr.FeatureDefn,
+                 target_defn: ogr.FeatureDefn) -> ogr.Feature:
+    out_feature = ogr.Feature(target_defn)
+    for index in range(source_defn.GetFieldCount()):
+        if feature.IsFieldSetAndNotNull(index):
+            out_feature.SetField(index, feature.GetField(index))
+    geom = feature.GetGeometryRef()
+    if geom is not None:
+        out_feature.SetGeometry(geom.Clone())
+    return out_feature
+
+
+def thin_point_layer(dataset_dir: Path, layer_name: str, min_distance_m: float) -> int:
+    path = dataset_dir / f"{layer_name}.shp"
+    if not path.exists():
+        return 0
+
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    source_ds = ogr.Open(str(path))
+    if source_ds is None:
+        return 0
+    source_layer = source_ds.GetLayer(0)
+    if source_layer is None:
+        source_ds = None
+        return 0
+
+    source_defn = source_layer.GetLayerDefn()
+    to_utm, _ = projection()
+    rows = []
+    source_layer.ResetReading()
+    for feature in source_layer:
+        geom = feature.GetGeometryRef()
+        if geom is None or geom.GetGeometryType() not in (ogr.wkbPoint, ogr.wkbPoint25D):
+            continue
+        lon = geom.GetX()
+        lat = geom.GetY()
+        x, y, _ = to_utm.TransformPoint(lon, lat)
+        rows.append(
+            {
+                "feature": feature.Clone(),
+                "x": x,
+                "y": y,
+                "population": feature_population(feature, source_defn),
+                "name": field_text(feature, field_index(source_defn, "name")),
+                "fid": feature.GetFID(),
+            }
+        )
+
+    if not rows:
+        source_ds = None
+        return 0
+
+    rows.sort(key=lambda row: (-row["population"], row["name"], row["fid"]))
+    accepted = []
+    min_distance_sq = min_distance_m * min_distance_m
+    skipped = 0
+    for row in rows:
+        too_close = any(
+            (row["x"] - kept["x"]) ** 2 + (row["y"] - kept["y"]) ** 2 < min_distance_sq
+            for kept in accepted
+        )
+        if too_close:
+            skipped += 1
+            continue
+        accepted.append(row)
+
+    if skipped == 0:
+        source_ds = None
+        return 0
+
+    tmp_dir = dataset_dir / f".thin_{layer_name}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    tmp_ds = driver.CreateDataSource(str(tmp_dir))
+    tmp_layer = tmp_ds.CreateLayer(layer_name, source_layer.GetSpatialRef(), source_layer.GetGeomType())
+    for index in range(source_defn.GetFieldCount()):
+        tmp_layer.CreateField(clone_field_defn(source_defn.GetFieldDefn(index)))
+    tmp_defn = tmp_layer.GetLayerDefn()
+
+    for row in accepted:
+        out_feature = copy_feature(row["feature"], source_defn, tmp_defn)
+        tmp_layer.CreateFeature(out_feature)
+        out_feature = None
+
+    tmp_layer.SyncToDisk()
+    tmp_ds = None
+    source_ds = None
+
+    remove_layer(dataset_dir, layer_name)
+    for ext in SHAPE_EXTENSIONS:
+        src = tmp_dir / f"{layer_name}{ext}"
+        if src.exists():
+            shutil.move(str(src), dataset_dir / src.name)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return skipped
+
+
 def copernicus_url(lat: int, lon: int) -> str:
     ns = "N" if lat >= 0 else "S"
     ew = "E" if lon >= 0 else "W"
@@ -768,6 +880,7 @@ def build(args: argparse.Namespace) -> None:
         dataset_dir.mkdir(parents=True, exist_ok=True)
         counts: Dict[str, int] = {}
         duplicate_counts: Dict[str, int] = {}
+        spacing_counts: Dict[str, int] = {}
         for layer_name, layer_sources in LAYER_SOURCES.items():
             wrote_any = False
             remove_layer(dataset_dir, layer_name)
@@ -789,10 +902,16 @@ def build(args: argparse.Namespace) -> None:
             if not has_layer(dataset_dir, layer_name):
                 make_empty_from_template(template_dir, dataset_dir, layer_name)
             duplicate_counts[layer_name] = dedupe_layer(dataset_dir, layer_name)
+            spacing_counts[layer_name] = thin_point_layer(
+                dataset_dir,
+                layer_name,
+                POINT_SPACING_RULES_M.get(layer_name, 0.0),
+            ) if layer_name in POINT_SPACING_RULES_M else 0
             counts[layer_name] = ogr_count(dataset_dir / f"{layer_name}.shp", layer_name) or 0
             print(
                 f"== tile {tile.name}: {layer_name} features={counts[layer_name]} "
-                f"duplicates_removed={duplicate_counts[layer_name]}",
+                f"duplicates_removed={duplicate_counts[layer_name]} "
+                f"spacing_removed={spacing_counts[layer_name]}",
                 flush=True,
             )
 
@@ -807,6 +926,7 @@ def build(args: argparse.Namespace) -> None:
                 "bounds": tile.bounds,
                 "feature_counts": counts,
                 "duplicates_removed": duplicate_counts,
+                "spacing_removed": spacing_counts,
                 "archive": f"osm/{tile.name}.7z",
                 "archive_size": archive.stat().st_size,
                 "archive_size_text": size_text(archive.stat().st_size),
