@@ -182,7 +182,7 @@ LAYER_SOURCES: Dict[str, List[LayerSource]] = {
     "village_point": [
         LayerSource(
             "gis_osm_places_free_1",
-            "fclass = 'village' AND population >= 1000",
+            "fclass = 'village'",
             POINT_NLT,
         ),
     ],

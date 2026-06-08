@@ -90,9 +90,16 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v3"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v4"
 TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "5000"))
-TASK_MAP_LABEL_POINT_LAYERS = ("city_point", "town_point", "village_point", "suburb_point")
+TASK_MAP_LABEL_POINT_LAYERS = tuple(
+    layer.strip()
+    for layer in os.environ.get(
+        "KIGO_TASK_MAP_LABEL_POINT_LAYERS",
+        "village_point,suburb_point",
+    ).split(",")
+    if layer.strip()
+)
 TASK_MAP_LABEL_LAYER_PRIORITY = {
     "city_point": 0,
     "town_point": 1,
@@ -770,16 +777,18 @@ def thin_label_point_layers(layer_payloads, min_distance_m: float):
     )
 
     keep = {layer_name: set() for layer_name in layer_payloads}
-    accepted = []
+    accepted_by_layer = {layer_name: [] for layer_name in layer_payloads}
     min_distance_sq = min_distance_m * min_distance_m
     for candidate in candidates:
+        accepted = accepted_by_layer.setdefault(candidate["layer"], [])
         if any(geodesic_distance_sq_m(candidate["xy"], chosen["xy"]) < min_distance_sq
                for chosen in accepted):
             continue
         accepted.append(candidate)
         keep[candidate["layer"]].add(candidate["index"])
 
-    return keep, len(candidates), len(candidates) - len(accepted)
+    accepted_count = sum(len(rows) for rows in accepted_by_layer.values())
+    return keep, len(candidates), len(candidates) - accepted_count
 
 
 def build_shp_bytes(header: bytes, records):
