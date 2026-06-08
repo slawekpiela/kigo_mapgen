@@ -18,6 +18,8 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -88,7 +90,15 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v1"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v2"
+TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "5000"))
+TASK_MAP_LABEL_POINT_LAYERS = ("city_point", "town_point", "village_point", "suburb_point")
+TASK_MAP_LABEL_LAYER_PRIORITY = {
+    "city_point": 0,
+    "town_point": 1,
+    "village_point": 2,
+    "suburb_point": 3,
+}
 
 
 @dataclass(frozen=True)
@@ -635,6 +645,240 @@ def runway_polyline_layers(features):
     }
 
 
+def dbf_field_specs(data: bytes):
+    if len(data) < 32:
+        return [], 0, 0, b""
+    header_len = struct.unpack_from("<H", data, 8)[0]
+    record_len = struct.unpack_from("<H", data, 10)[0]
+    fields = []
+    offset = 32
+    while offset + 32 <= header_len and data[offset] != 0x0D:
+        raw = data[offset:offset + 32]
+        name = raw[:11].split(b"\0", 1)[0].decode("latin1", errors="replace").strip()
+        length = raw[16]
+        fields.append((name, length))
+        offset += 32
+    return fields, header_len, record_len, data[32:header_len]
+
+
+def dbf_rows(data: bytes):
+    fields, header_len, record_len, _ = dbf_field_specs(data)
+    if not fields or record_len <= 0:
+        return []
+    count = struct.unpack_from("<I", data, 4)[0]
+    rows = []
+    for index in range(count):
+        start = header_len + index * record_len
+        row = data[start:start + record_len]
+        if len(row) != record_len:
+            break
+        rows.append(row)
+    return rows
+
+
+def dbf_value(row: bytes, fields, key: str) -> str:
+    position = 1
+    for name, length in fields:
+        value = row[position:position + length]
+        if name.lower() == key.lower():
+            return value.decode("latin1", errors="replace").strip()
+        position += length
+    return ""
+
+
+def point_record_xy(content: bytes):
+    if len(content) < 20:
+        return None
+    shape_type = struct.unpack_from("<i", content, 0)[0]
+    if shape_type != 1:
+        return None
+    return struct.unpack_from("<dd", content, 4)
+
+
+def shp_records(data: bytes):
+    if len(data) < 100:
+        return b"", []
+    header = data[:100]
+    offset = 100
+    records = []
+    while offset + 8 <= len(data):
+        _, length_words = struct.unpack_from(">ii", data, offset)
+        offset += 8
+        content = data[offset:offset + length_words * 2]
+        offset += length_words * 2
+        bbox = crop.shp_record_bbox(content)
+        records.append({"content": content, "length_words": length_words, "bbox": bbox})
+    return header, records
+
+
+def geodesic_distance_sq_m(a, b):
+    lon1, lat1 = a
+    lon2, lat2 = b
+    mean_lat = math.radians((lat1 + lat2) / 2.0)
+    meters_per_lat = 111320.0
+    meters_per_lon = meters_per_lat * max(0.01, math.cos(mean_lat))
+    dx = (lon1 - lon2) * meters_per_lon
+    dy = (lat1 - lat2) * meters_per_lat
+    return dx * dx + dy * dy
+
+
+def parse_population(value: str) -> int:
+    try:
+        return int(float(str(value or "0").replace(",", ".")))
+    except ValueError:
+        return 0
+
+
+def thin_label_point_layers(layer_payloads, min_distance_m: float):
+    candidates = []
+    for layer_name, payload in layer_payloads.items():
+        fields, _, _, _ = dbf_field_specs(payload["dbf"])
+        rows = dbf_rows(payload["dbf"])
+        for index, record in enumerate(payload["records"]):
+            if index >= len(rows):
+                continue
+            xy = point_record_xy(record["content"])
+            if xy is None:
+                continue
+            row = rows[index]
+            candidates.append(
+                {
+                    "layer": layer_name,
+                    "index": index,
+                    "xy": xy,
+                    "name": dbf_value(row, fields, "name"),
+                    "population": parse_population(dbf_value(row, fields, "population")),
+                    "priority": TASK_MAP_LABEL_LAYER_PRIORITY.get(layer_name, 99),
+                }
+            )
+
+    candidates.sort(
+        key=lambda item: (
+            item["priority"],
+            -item["population"],
+            item["name"],
+            item["index"],
+        )
+    )
+
+    keep = {layer_name: set() for layer_name in layer_payloads}
+    accepted = []
+    min_distance_sq = min_distance_m * min_distance_m
+    for candidate in candidates:
+        if any(geodesic_distance_sq_m(candidate["xy"], chosen["xy"]) < min_distance_sq
+               for chosen in accepted):
+            continue
+        accepted.append(candidate)
+        keep[candidate["layer"]].add(candidate["index"])
+
+    return keep, len(candidates), len(candidates) - len(accepted)
+
+
+def build_shp_bytes(header: bytes, records):
+    length_words = (100 + sum(8 + len(record["content"]) for record in records)) // 2
+    out = bytearray(crop.update_shp_header(header, length_words, records))
+    for number, record in enumerate(records, 1):
+        out.extend(struct.pack(">ii", number, record["length_words"]))
+        out.extend(record["content"])
+    return bytes(out)
+
+
+def build_shx_bytes(header: bytes, records):
+    length_words = (100 + len(records) * 8) // 2
+    out = bytearray(crop.update_shp_header(header, length_words, records))
+    offset_words = 50
+    for record in records:
+        out.extend(struct.pack(">ii", offset_words, record["length_words"]))
+        offset_words += 4 + record["length_words"]
+    return bytes(out)
+
+
+def build_dbf_bytes(dbf: bytes, keep_indices):
+    if len(dbf) < 32:
+        return dbf
+    fields, header_len, record_len, rest_header = dbf_field_specs(dbf)
+    if not fields or record_len <= 0:
+        return dbf
+    rows = dbf_rows(dbf)
+    selected = [row for index, row in enumerate(rows) if index in keep_indices]
+    header = bytearray(dbf[:32])
+    struct.pack_into("<I", header, 4, len(selected))
+    return bytes(header) + rest_header + b"".join(selected) + b"\x1a"
+
+
+def rewrite_xcm_with_thinned_labels(xcm_bytes: bytes):
+    if TASK_MAP_LABEL_SPACING_M <= 0:
+        return xcm_bytes, {}
+
+    with tempfile.TemporaryDirectory(prefix="kigo_label_thin_") as tmp:
+        src_path = Path(tmp) / "src.xcm"
+        dst_path = Path(tmp) / "dst.xcm"
+        src_path.write_bytes(xcm_bytes)
+
+        with zipfile.ZipFile(src_path) as zin:
+            names = set(zin.namelist())
+            layer_payloads = {}
+            for layer_name in TASK_MAP_LABEL_POINT_LAYERS:
+                required = {f"{layer_name}.shp", f"{layer_name}.shx", f"{layer_name}.dbf"}
+                if not required.issubset(names):
+                    continue
+                header, records = shp_records(zin.read(f"{layer_name}.shp"))
+                layer_payloads[layer_name] = {
+                    "header": header,
+                    "records": records,
+                    "dbf": zin.read(f"{layer_name}.dbf"),
+                    "shx": zin.read(f"{layer_name}.shx"),
+                }
+
+            if not layer_payloads:
+                return xcm_bytes, {}
+
+            keep, total, removed = thin_label_point_layers(
+                layer_payloads,
+                TASK_MAP_LABEL_SPACING_M,
+            )
+            if removed <= 0:
+                return xcm_bytes, {"total": total, "removed": 0}
+
+            replacements = {}
+            changed_layers = set()
+            stats = {"total": total, "removed": removed, "layers": {}}
+            for layer_name, payload in layer_payloads.items():
+                keep_indices = keep.get(layer_name, set())
+                records = [
+                    record
+                    for index, record in enumerate(payload["records"])
+                    if index in keep_indices
+                ]
+                before = len(payload["records"])
+                after = len(records)
+                if before == after:
+                    continue
+                changed_layers.add(layer_name)
+                stats["layers"][layer_name] = {"before": before, "after": after}
+                replacements[f"{layer_name}.shp"] = build_shp_bytes(payload["header"], records)
+                replacements[f"{layer_name}.shx"] = build_shx_bytes(payload["header"], records)
+                replacements[f"{layer_name}.dbf"] = build_dbf_bytes(payload["dbf"], keep_indices)
+
+            with zipfile.ZipFile(dst_path, "w", compression=zipfile.ZIP_STORED) as zout:
+                for info in zin.infolist():
+                    if info.filename in replacements:
+                        new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                        new_info.external_attr = info.external_attr
+                        new_info.compress_type = zipfile.ZIP_STORED
+                        zout.writestr(new_info, replacements[info.filename])
+                        continue
+                    if any(info.filename == f"{layer}.qix" for layer in changed_layers):
+                        continue
+                    new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                    new_info.external_attr = info.external_attr
+                    new_info.compress_type = zipfile.ZIP_STORED
+                    with zin.open(info) as src, zout.open(new_info, "w") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+        return dst_path.read_bytes(), stats
+
+
 def validate_bbox(bbox):
     if bbox["south"] >= bbox["north"]:
         raise ValueError("bbox.south must be less than bbox.north")
@@ -983,6 +1227,21 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
                 f"[mapgen] runway injection failed (returning plain map): {exc}",
                 file=sys.stderr, flush=True,
             )
+
+    try:
+        raw, label_stats = rewrite_xcm_with_thinned_labels(raw)
+        if label_stats:
+            print(
+                f"[mapgen] label thinning stats={json.dumps(label_stats, sort_keys=True)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[mapgen] label thinning failed (returning unthinned map): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     print(f"[mapgen] done name={name!r} uuid={uuid} bytes={len(raw)}", file=sys.stderr, flush=True)
     return raw, ""
