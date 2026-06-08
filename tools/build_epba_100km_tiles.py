@@ -301,7 +301,7 @@ MANIFEST_LAYERS = [
         "dataset": "osm",
         "layer": "suburb_point",
         "label": "name",
-        "range": 1,
+        "range": 3,
         "color": "223,223,0",
     },
     {
@@ -310,7 +310,7 @@ MANIFEST_LAYERS = [
         "dataset": "osm",
         "layer": "village_point",
         "label": "name",
-        "range": 1,
+        "range": 3,
         "color": "223,223,0",
     },
     {
