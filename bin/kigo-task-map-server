@@ -90,8 +90,8 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v5"
-TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "5000"))
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v6"
+TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "3000"))
 TASK_MAP_LABEL_POINT_LAYERS = tuple(
     layer.strip()
     for layer in os.environ.get(

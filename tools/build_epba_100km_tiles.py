@@ -35,7 +35,7 @@ LINE_NLT = "MULTILINESTRING"
 POINT_NLT = "POINT"
 SHAPE_EXTENSIONS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
 POINT_SPACING_RULES_M = {
-    "village_point": 5_000.0,
+    "village_point": 3_000.0,
 }
 
 
