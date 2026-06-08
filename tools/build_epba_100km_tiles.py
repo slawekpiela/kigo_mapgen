@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from osgeo import osr
+from osgeo import ogr, osr
 
 
 EPBA_LAT = 49.805
@@ -122,10 +122,11 @@ LAYER_SOURCES: Dict[str, List[LayerSource]] = {
         ),
     ],
     "water_area_large": [
-        LayerSource("gis_osm_water_a_free_1", "1=1", AREA_NLT),
-    ],
-    "water_area_small": [
-        LayerSource("gis_osm_water_a_free_1", "1=1", AREA_NLT),
+        LayerSource(
+            "gis_osm_water_a_free_1",
+            "fclass IN ('water','reservoir')",
+            AREA_NLT,
+        ),
     ],
     "water_line": [
         LayerSource("gis_osm_waterways_free_1", "fclass IN ('river','canal')", LINE_NLT),
@@ -169,13 +170,18 @@ LAYER_SOURCES: Dict[str, List[LayerSource]] = {
         LayerSource("gis_osm_places_free_1", "fclass = 'town'", POINT_NLT),
     ],
     "suburb_point": [
-        LayerSource("gis_osm_places_free_1", "fclass = 'suburb'", POINT_NLT),
+        LayerSource(
+            "gis_osm_places_free_1",
+            "fclass = 'suburb' AND population >= 2000",
+            POINT_NLT,
+        ),
     ],
     "village_point": [
-        LayerSource("gis_osm_places_free_1", "fclass = 'village'", POINT_NLT),
-    ],
-    "hamlet_point": [
-        LayerSource("gis_osm_places_free_1", "fclass = 'hamlet'", POINT_NLT),
+        LayerSource(
+            "gis_osm_places_free_1",
+            "fclass = 'village' AND population >= 1000",
+            POINT_NLT,
+        ),
     ],
     "airstrip_area": [
         LayerSource(
@@ -210,14 +216,6 @@ MANIFEST_LAYERS = [
         "layer": "water_area_large",
         "label": "name",
         "range": 5,
-        "color": "98,157,251",
-    },
-    {
-        "name": "water_area_small",
-        "level_of_detail": 4,
-        "dataset": "osm",
-        "layer": "water_area_small",
-        "range": 1,
         "color": "98,157,251",
     },
     {
@@ -296,11 +294,11 @@ MANIFEST_LAYERS = [
     },
     {
         "name": "suburb_point",
-        "level_of_detail": 2,
+        "level_of_detail": 4,
         "dataset": "osm",
         "layer": "suburb_point",
         "label": "name",
-        "range": 3,
+        "range": 1,
         "color": "223,223,0",
     },
     {
@@ -308,15 +306,6 @@ MANIFEST_LAYERS = [
         "level_of_detail": 3,
         "dataset": "osm",
         "layer": "village_point",
-        "label": "name",
-        "range": 3,
-        "color": "223,223,0",
-    },
-    {
-        "name": "hamlet_point",
-        "level_of_detail": 4,
-        "dataset": "osm",
-        "layer": "hamlet_point",
         "label": "name",
         "range": 1,
         "color": "223,223,0",
@@ -527,6 +516,11 @@ def append_source(
             str(tile.bounds[3]),
             str(tile.bounds[1]),
             str(tile.bounds[2]),
+            "-clipsrc",
+            str(tile.bounds[0]),
+            str(tile.bounds[3]),
+            str(tile.bounds[1]),
+            str(tile.bounds[2]),
             "-nln",
             out_layer,
             "-nlt",
@@ -574,6 +568,111 @@ def make_empty_from_template(template_dir: Path, dataset_dir: Path, layer_name: 
             "1=0",
         ]
     )
+
+
+def field_index(layer_defn: ogr.FeatureDefn, field_name: str) -> int:
+    wanted = field_name.lower()
+    for index in range(layer_defn.GetFieldCount()):
+        if layer_defn.GetFieldDefn(index).GetName().lower() == wanted:
+            return index
+    return -1
+
+
+def field_text(feature: ogr.Feature, index: int) -> str:
+    if index < 0 or not feature.IsFieldSetAndNotNull(index):
+        return ""
+    value = feature.GetField(index)
+    return str(value).strip().casefold()
+
+
+def dedupe_key(feature: ogr.Feature, layer_defn: ogr.FeatureDefn) -> Tuple[object, ...]:
+    osm_id = field_text(feature, field_index(layer_defn, "osm_id"))
+    if osm_id and osm_id != "0":
+        return ("osm_id", osm_id)
+
+    name = field_text(feature, field_index(layer_defn, "name"))
+    fclass = field_text(feature, field_index(layer_defn, "fclass"))
+    geom = feature.GetGeometryRef()
+    if geom is None:
+        return ("nogeom", fclass, name)
+
+    clone = geom.Clone()
+    clone.FlattenTo2D()
+    envelope = tuple(round(value, 7) for value in clone.GetEnvelope())
+    geom_hash = hashlib.md5(bytes(clone.ExportToWkb())).hexdigest()
+    return ("geometry_name", fclass, name, envelope, geom_hash)
+
+
+def clone_field_defn(field: ogr.FieldDefn) -> ogr.FieldDefn:
+    cloned = ogr.FieldDefn(field.GetName(), field.GetType())
+    cloned.SetWidth(field.GetWidth())
+    cloned.SetPrecision(field.GetPrecision())
+    if hasattr(cloned, "SetSubType") and hasattr(field, "GetSubType"):
+        cloned.SetSubType(field.GetSubType())
+    if hasattr(cloned, "SetNullable") and hasattr(field, "IsNullable"):
+        cloned.SetNullable(field.IsNullable())
+    if hasattr(cloned, "SetDefault") and hasattr(field, "GetDefault"):
+        cloned.SetDefault(field.GetDefault())
+    return cloned
+
+
+def dedupe_layer(dataset_dir: Path, layer_name: str) -> int:
+    path = dataset_dir / f"{layer_name}.shp"
+    if not path.exists():
+        return 0
+
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    source_ds = ogr.Open(str(path))
+    if source_ds is None:
+        return 0
+    source_layer = source_ds.GetLayer(0)
+    if source_layer is None:
+        source_ds = None
+        return 0
+
+    source_defn = source_layer.GetLayerDefn()
+    tmp_dir = dataset_dir / f".dedupe_{layer_name}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    tmp_ds = driver.CreateDataSource(str(tmp_dir))
+    tmp_layer = tmp_ds.CreateLayer(layer_name, source_layer.GetSpatialRef(), source_layer.GetGeomType())
+    for index in range(source_defn.GetFieldCount()):
+        tmp_layer.CreateField(clone_field_defn(source_defn.GetFieldDefn(index)))
+    tmp_defn = tmp_layer.GetLayerDefn()
+
+    seen = set()
+    skipped = 0
+    source_layer.ResetReading()
+    for source_feature in source_layer:
+        key = dedupe_key(source_feature, source_defn)
+        if key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+
+        out_feature = ogr.Feature(tmp_defn)
+        for index in range(source_defn.GetFieldCount()):
+            if source_feature.IsFieldSetAndNotNull(index):
+                out_feature.SetField(index, source_feature.GetField(index))
+        geom = source_feature.GetGeometryRef()
+        if geom is not None:
+            out_feature.SetGeometry(geom.Clone())
+        tmp_layer.CreateFeature(out_feature)
+        out_feature = None
+
+    tmp_layer.SyncToDisk()
+    tmp_ds = None
+    source_ds = None
+
+    remove_layer(dataset_dir, layer_name)
+    for ext in SHAPE_EXTENSIONS:
+        src = tmp_dir / f"{layer_name}{ext}"
+        if src.exists():
+            shutil.move(str(src), dataset_dir / src.name)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return skipped
 
 
 def copernicus_url(lat: int, lon: int) -> str:
@@ -668,6 +767,7 @@ def build(args: argparse.Namespace) -> None:
             shutil.rmtree(dataset_dir)
         dataset_dir.mkdir(parents=True, exist_ok=True)
         counts: Dict[str, int] = {}
+        duplicate_counts: Dict[str, int] = {}
         for layer_name, layer_sources in LAYER_SOURCES.items():
             wrote_any = False
             remove_layer(dataset_dir, layer_name)
@@ -688,8 +788,13 @@ def build(args: argparse.Namespace) -> None:
                     )
             if not has_layer(dataset_dir, layer_name):
                 make_empty_from_template(template_dir, dataset_dir, layer_name)
+            duplicate_counts[layer_name] = dedupe_layer(dataset_dir, layer_name)
             counts[layer_name] = ogr_count(dataset_dir / f"{layer_name}.shp", layer_name) or 0
-            print(f"== tile {tile.name}: {layer_name} features={counts[layer_name]}", flush=True)
+            print(
+                f"== tile {tile.name}: {layer_name} features={counts[layer_name]} "
+                f"duplicates_removed={duplicate_counts[layer_name]}",
+                flush=True,
+            )
 
         archive = repo_osm / f"{tile.name}.7z"
         if archive.exists():
@@ -701,6 +806,7 @@ def build(args: argparse.Namespace) -> None:
                 "name": tile.name,
                 "bounds": tile.bounds,
                 "feature_counts": counts,
+                "duplicates_removed": duplicate_counts,
                 "archive": f"osm/{tile.name}.7z",
                 "archive_size": archive.stat().st_size,
                 "archive_size_text": size_text(archive.stat().st_size),
