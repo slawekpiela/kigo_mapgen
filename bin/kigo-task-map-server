@@ -11,6 +11,7 @@ bbox mapgen request.
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,11 +52,17 @@ BASE_MAP_CANDIDATES = (
 )
 
 TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset(("path_line", "track_line"))
+TASK_MAP_LABEL_TOPOLOGY_ROWS = {
+    "town_point": "town_point,10,,1,223,223,0,1,8,3,255",
+    "suburb_point": "suburb_point,3,,1,223,223,0,1,1,0,255",
+    "village_point": "village_point,3,,1,223,223,0,1,2,0,255",
+}
 TASK_MAP_FORCED_TOPOLOGY_ROWS = {
     "airstrip_area": "airstrip_area,10,,1,187,187,204,1,1,1,255",
     "runway_area": "runway_area,20,,0,25,25,25,1,0,0,255",
     "runway_casing_line": "runway_casing_line,20,,0,0,0,0,15,0,0,255",
     "runway_line": "runway_line,20,,0,255,255,255,7,0,0,255",
+    **TASK_MAP_LABEL_TOPOLOGY_ROWS,
 }
 TASK_MAP_MARGIN_KM = 30.0
 TASK_MAP_RUNWAY_VISIBLE_WIDTH_M = float(
@@ -90,7 +97,7 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v6"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v8"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -868,8 +875,59 @@ def blank_dbf_name_fields(dbf: bytes):
     return bytes(out), changed
 
 
+def rewrite_topology_template_bytes(
+    topology: bytes,
+    forced_rows: dict[str, str],
+    available_stems: set[str],
+):
+    changed = {}
+    written = set()
+    out = []
+
+    try:
+        text = topology.decode("utf-8")
+    except UnicodeDecodeError:
+        text = topology.decode("latin1", errors="replace")
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("*"):
+            try:
+                row = next(csv.reader([line]))
+            except Exception:
+                row = []
+
+            if row:
+                stem = row[0].strip().lower()
+                forced = forced_rows.get(stem)
+                if forced and stem in available_stems:
+                    forced_line = forced.rstrip() + "\n"
+                    if forced_line != line:
+                        changed[stem] = "updated"
+                    out.append(forced_line)
+                    written.add(stem)
+                    continue
+
+        out.append(line)
+
+    for stem, forced in forced_rows.items():
+        if stem in written or stem not in available_stems:
+            continue
+        out.append(forced.rstrip() + "\n")
+        changed[stem] = "added"
+
+    if not changed:
+        return topology, {}
+
+    return "".join(out).encode("utf-8"), changed
+
+
 def rewrite_xcm_with_thinned_labels(xcm_bytes: bytes):
-    if TASK_MAP_LABEL_SPACING_M <= 0 and not TASK_MAP_SUPPRESSED_NAME_LAYERS:
+    if (
+        TASK_MAP_LABEL_SPACING_M <= 0
+        and not TASK_MAP_SUPPRESSED_NAME_LAYERS
+        and not TASK_MAP_LABEL_TOPOLOGY_ROWS
+    ):
         return xcm_bytes, {}
 
     with tempfile.TemporaryDirectory(prefix="kigo_label_thin_") as tmp:
@@ -895,6 +953,21 @@ def rewrite_xcm_with_thinned_labels(xcm_bytes: bytes):
             replacements = {}
             changed_layers = set()
             stats = {}
+            available_stems = {
+                Path(name).stem.lower()
+                for name in names
+                if name.lower().endswith(".shp")
+            }
+
+            if "topology.tpl" in names:
+                topology, topology_changed = rewrite_topology_template_bytes(
+                    zin.read("topology.tpl"),
+                    TASK_MAP_LABEL_TOPOLOGY_ROWS,
+                    available_stems,
+                )
+                if topology_changed:
+                    replacements["topology.tpl"] = topology
+                    stats["topology_rows"] = topology_changed
 
             if layer_payloads and TASK_MAP_LABEL_SPACING_M > 0:
                 keep, total, removed = thin_label_point_layers(
@@ -1108,6 +1181,8 @@ def read_cached_xcm(cache_key: str):
         return None
     try:
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if metadata.get("version") != TASK_MAP_XCM_CACHE_VERSION:
+            return None
         return xcm_path.read_bytes(), metadata, xcm_path
     except Exception:
         return None
@@ -1127,6 +1202,8 @@ def find_covering_cached_xcm(required_bbox, source_key: str):
     for meta_path in TASK_MAP_XCM_CACHE_DIR.glob("*.json"):
         try:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            if metadata.get("version") != TASK_MAP_XCM_CACHE_VERSION:
+                continue
             if metadata.get("source_key") != source_key:
                 continue
             cached_bbox = metadata.get("bbox")

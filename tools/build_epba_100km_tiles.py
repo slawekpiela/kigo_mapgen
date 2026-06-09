@@ -292,6 +292,7 @@ MANIFEST_LAYERS = [
         "layer": "town_point",
         "label": "name",
         "range": 10,
+        "label_range": 8,
         "label_important_range": 3,
         "color": "223,223,0",
     },
@@ -302,6 +303,7 @@ MANIFEST_LAYERS = [
         "layer": "suburb_point",
         "label": "name",
         "range": 3,
+        "label_range": 1,
         "color": "223,223,0",
     },
     {
@@ -311,6 +313,7 @@ MANIFEST_LAYERS = [
         "layer": "village_point",
         "label": "name",
         "range": 3,
+        "label_range": 2,
         "color": "223,223,0",
     },
     {
