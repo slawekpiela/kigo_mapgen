@@ -14,7 +14,7 @@ DEFAULT_ESTIMATED_POWER_WATTS = 25.0
 
 
 class Worker:
-    def __init__(self, dir_jobs, dir_data, mail_server):
+    def __init__(self, dir_jobs, dir_data):
         check_commands()
         self.__dir_jobs = os.path.abspath(dir_jobs)
         self.__dir_data = os.path.abspath(dir_data)
@@ -127,8 +127,8 @@ class Worker:
         try:
             print(
                 (
-                    "Generating map file for job uuid={}, name={}, mail={}".format(
-                        job.uuid, job.description.name, job.description.mail
+                    "Generating map file for job uuid={}, name={}".format(
+                        job.uuid, job.description.name
                     )
                 )
             )
@@ -144,9 +144,7 @@ class Worker:
                 generator = Generator(dir_data, job.file_path("tmp"))
 
                 generator.set_bounds(description.bounds)
-                generator.add_information_file(
-                    job.description.name, job.description.mail
-                )
+                generator.add_information_file(job.description.name)
                 generator.add_attribution_file()
 
                 if description.use_topology:
@@ -225,13 +223,6 @@ class Worker:
             self.__log_job_metrics(job, started_at, job_status)
 
         print(("Map {} is ready for use.".format(job.map_file())))
-        if job.description.mail != "":
-            print(
-                (
-                    "Download mail disabled; not sending notification to {}."
-                    .format(job.description.mail)
-                )
-            )
 
     def run(self):
         self.__run = True

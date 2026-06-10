@@ -57,7 +57,7 @@ lib/xcsoar/mapgen/
 1. Uzytkownik otwiera formularz z `server/views/index.html`.
 2. `server/server.py:Server.index()` obsluguje POST.
 3. Tworzony jest `JobDescription` z opcjami:
-   `name`, `mail`, `bounds`, `resolution`, `level_of_detail`, `compressed`,
+   `name`, `bounds`, `resolution`, `level_of_detail`, `compressed`,
    `welt2000`, `high_quality`, `terrain_plus`, `omit_path_lines`,
    `omit_track_lines`.
 4. `Job(self.__dir_jobs, desc)` tworzy katalog:
@@ -383,7 +383,7 @@ Smoke linii metryk w live workerze:
 
 ```sh
 docker exec -e PYTHONPATH=/opt/mapgen/lib mapgen-mapgen-worker-1 python3 -c \
-'import time; from xcsoar.mapgen.server.worker import Worker; Bounds = type("Bounds", (), {"left": 19.0, "right": 20.0, "top": 50.0, "bottom": 49.0}); Description = type("Description", (), {"name": "smoke", "bounds": Bounds()}); Job = type("Job", (), {"uuid": "smoke-uuid", "description": Description()}); worker = Worker("/tmp", "/tmp", ""); worker._Worker__log_job_metrics(Job(), time.monotonic() - 2.5, "done")'
+'import time; from xcsoar.mapgen.server.worker import Worker; Bounds = type("Bounds", (), {"left": 19.0, "right": 20.0, "top": 50.0, "bottom": 49.0}); Description = type("Description", (), {"name": "smoke", "bounds": Bounds()}); Job = type("Job", (), {"uuid": "smoke-uuid", "description": Description()}); worker = Worker("/tmp", "/tmp"); worker._Worker__log_job_metrics(Job(), time.monotonic() - 2.5, "done")'
 ```
 
 ## Typowy workflow commit/push

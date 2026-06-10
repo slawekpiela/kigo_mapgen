@@ -13,7 +13,6 @@ def main():
     Worker(
         dir_jobs=os.path.join(app_dir, "jobs"),
         dir_data=os.path.join(app_dir, "data"),
-        mail_server="localhost",
     ).run()
 
 

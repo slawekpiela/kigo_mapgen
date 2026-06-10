@@ -1319,7 +1319,6 @@ def _mapgen_submit(bbox, name):
     """POST to mapgen and return job UUID.  Raises on failure."""
     form = {
         "name": (name or "task_map")[:80],
-        "mail": "",
         "highres": "on",           # standard mapgen topology, 3 arc-second terrain
         "level_of_detail": "3",
         "selection": "bounds",

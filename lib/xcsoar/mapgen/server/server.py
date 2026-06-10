@@ -116,7 +116,6 @@ class Server(object):
 
         desc = JobDescription()
         desc.name = name
-        desc.mail = params["mail"]
         desc.high_quality = "high_quality" in params
         desc.terrain_plus = "terrain_plus" in params
         desc.omit_path_lines = "omit_path_lines" in params
