@@ -51,6 +51,13 @@ BASE_MAP_CANDIDATES = (
     "/home/slawek/mapgen-output/nowa_mapa.xcm",
 )
 
+DEFAULT_BASE_MAP_TILE_DIRS = (
+    "/maps/taskmap-base-tiles-3arcsec-runways",
+    "/maps/taskmap-base-tiles",
+    "/home/slawek/mapgen-output/taskmap-base-tiles-3arcsec-runways",
+    "/home/slawek/mapgen-output/taskmap-base-tiles",
+)
+
 TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset()
 TASK_MAP_LABEL_TOPOLOGY_ROWS = {}
 TASK_MAP_FORCED_TOPOLOGY_ROWS = {
@@ -160,19 +167,36 @@ def xcm_terrain_bbox(xcm: Path):
     return {"south": south, "west": west, "north": north, "east": east}
 
 
-def find_base_maps(configured) -> tuple[BaseMap, ...]:
-    candidates = []
+def base_map_tile_dirs() -> tuple[Path, ...]:
+    configured = os.environ.get("KIGO_TASK_MAP_BASE_TILE_DIRS")
+    if configured:
+        parts = configured.replace(";", ",").split(",")
+        return tuple(Path(part.strip()) for part in parts if part.strip())
+    return tuple(Path(path) for path in DEFAULT_BASE_MAP_TILE_DIRS)
+
+
+def iter_base_map_candidates(configured):
     if configured is not None:
-        candidates.append(configured)
+        yield configured
 
     env_path = os.environ.get("KIGO_TASK_MAP_BASE_XCM")
     if env_path:
-        candidates.append(Path(env_path))
+        yield Path(env_path)
 
-    candidates.extend(Path(path) for path in BASE_MAP_CANDIDATES)
+    for directory in base_map_tile_dirs():
+        if not directory.exists() or not directory.is_dir():
+            continue
+        for candidate in sorted(directory.glob("*.xcm")):
+            yield candidate
+
+    for path in BASE_MAP_CANDIDATES:
+        yield Path(path)
+
+
+def find_base_maps(configured) -> tuple[BaseMap, ...]:
     seen = set()
     base_maps = []
-    for candidate in candidates:
+    for candidate in iter_base_map_candidates(configured):
         if candidate in seen:
             continue
         seen.add(candidate)
@@ -1086,6 +1110,7 @@ def bbox_header_text(bbox) -> str:
 
 
 def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
+    matching = []
     for base_map in base_maps:
         if not bbox_contains(base_map.bbox, bbox):
             continue
@@ -1097,7 +1122,10 @@ def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
                 file=sys.stderr, flush=True,
             )
             continue
-        return base_map
+        matching.append((bbox_area_key(base_map.bbox), base_map))
+
+    if matching:
+        return min(matching, key=lambda item: item[0])[1]
 
     formatted = (
         f"{bbox['south']:.6f},{bbox['west']:.6f},"
