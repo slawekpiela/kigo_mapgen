@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -34,9 +35,7 @@ AREA_NLT = "MULTIPOLYGON"
 LINE_NLT = "MULTILINESTRING"
 POINT_NLT = "POINT"
 SHAPE_EXTENSIONS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
-POINT_SPACING_RULES_M = {
-    "village_point": 3_000.0,
-}
+POINT_SPACING_RULES_M = {}
 
 
 @dataclass(frozen=True)
@@ -44,6 +43,7 @@ class SourcePackage:
     name: str
     url: str
     kind: str  # shp_zip or gpkg_zip
+    pbf_url: str
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,13 @@ class LayerSource:
     source_layer: str
     where: str
     nlt: str
-    source_file: Optional[str] = None
+    source_file: str = "vector"
+
+
+@dataclass(frozen=True)
+class PreparedPackage:
+    vector_path: Path
+    pbf_places_path: Optional[Path]
 
 
 @dataclass
@@ -67,51 +73,61 @@ SOURCES = [
         "pl_slaskie",
         "https://download.geofabrik.de/europe/poland/slaskie-latest-free.shp.zip",
         "shp_zip",
+        "https://download.geofabrik.de/europe/poland/slaskie-latest.osm.pbf",
     ),
     SourcePackage(
         "pl_malopolskie",
         "https://download.geofabrik.de/europe/poland/malopolskie-latest-free.shp.zip",
         "shp_zip",
+        "https://download.geofabrik.de/europe/poland/malopolskie-latest.osm.pbf",
     ),
     SourcePackage(
         "pl_opolskie",
         "https://download.geofabrik.de/europe/poland/opolskie-latest-free.shp.zip",
         "shp_zip",
+        "https://download.geofabrik.de/europe/poland/opolskie-latest.osm.pbf",
     ),
     SourcePackage(
         "pl_swietokrzyskie",
         "https://download.geofabrik.de/europe/poland/swietokrzyskie-latest-free.shp.zip",
         "shp_zip",
+        "https://download.geofabrik.de/europe/poland/swietokrzyskie-latest.osm.pbf",
     ),
     SourcePackage(
         "pl_lodzkie",
         "https://download.geofabrik.de/europe/poland/lodzkie-latest-free.shp.zip",
         "shp_zip",
+        "https://download.geofabrik.de/europe/poland/lodzkie-latest.osm.pbf",
     ),
     SourcePackage(
         "pl_podkarpackie",
         "https://download.geofabrik.de/europe/poland/podkarpackie-latest-free.shp.zip",
         "shp_zip",
+        "https://download.geofabrik.de/europe/poland/podkarpackie-latest.osm.pbf",
     ),
     SourcePackage(
         "sk",
         "https://download.geofabrik.de/europe/slovakia-latest-free.shp.zip",
         "shp_zip",
+        "https://download.geofabrik.de/europe/slovakia-latest.osm.pbf",
     ),
     SourcePackage(
         "cz_moravskoslezky",
         "https://download.geofabrik.de/europe/czech-republic/moravskoslezky-latest-free.gpkg.zip",
         "gpkg_zip",
+        "https://download.geofabrik.de/europe/czech-republic/moravskoslezky-latest.osm.pbf",
     ),
     SourcePackage(
         "cz_olomoucky",
         "https://download.geofabrik.de/europe/czech-republic/olomoucky-latest-free.gpkg.zip",
         "gpkg_zip",
+        "https://download.geofabrik.de/europe/czech-republic/olomoucky-latest.osm.pbf",
     ),
     SourcePackage(
         "cz_zlinsky",
         "https://download.geofabrik.de/europe/czech-republic/zlinsky-latest-free.gpkg.zip",
         "gpkg_zip",
+        "https://download.geofabrik.de/europe/czech-republic/zlinsky-latest.osm.pbf",
     ),
 ]
 
@@ -159,31 +175,21 @@ LAYER_SOURCES: Dict[str, List[LayerSource]] = {
             LINE_NLT,
         ),
     ],
-    "roadsmall_line": [
-        LayerSource(
-            "gis_osm_roads_free_1",
-            "fclass IN ('residential','service','living_street','pedestrian','road')",
-            LINE_NLT,
-        ),
-    ],
     "city_point": [
-        LayerSource("gis_osm_places_free_1", "fclass = 'city'", POINT_NLT),
+        LayerSource("pbf_place_point", "fclass = 'city'", POINT_NLT, "pbf_places"),
     ],
     "town_point": [
-        LayerSource("gis_osm_places_free_1", "fclass = 'town'", POINT_NLT),
+        LayerSource("pbf_place_point", "fclass = 'town'", POINT_NLT, "pbf_places"),
     ],
     "suburb_point": [
-        LayerSource(
-            "gis_osm_places_free_1",
-            "fclass = 'suburb' AND population >= 2000",
-            POINT_NLT,
-        ),
+        LayerSource("pbf_place_point", "fclass = 'suburb'", POINT_NLT, "pbf_places"),
     ],
     "village_point": [
         LayerSource(
-            "gis_osm_places_free_1",
+            "pbf_place_point",
             "fclass = 'village'",
             POINT_NLT,
+            "pbf_places",
         ),
     ],
     "airstrip_area": [
@@ -268,21 +274,14 @@ MANIFEST_LAYERS = [
         "pen_width": 2,
     },
     {
-        "name": "roadsmall_line",
-        "level_of_detail": 3,
-        "dataset": "osm",
-        "layer": "roadsmall_line",
-        "range": 2,
-        "color": "195,195,190",
-    },
-    {
         "name": "city_point",
         "level_of_detail": 1,
         "dataset": "osm",
         "layer": "city_point",
         "label": "name",
-        "range": 15,
-        "label_important_range": 10,
+        "range": 100,
+        "label_range": 100,
+        "label_important_range": 50,
         "color": "223,223,0",
     },
     {
@@ -291,29 +290,75 @@ MANIFEST_LAYERS = [
         "dataset": "osm",
         "layer": "town_point",
         "label": "name",
-        "range": 10,
-        "label_range": 8,
-        "label_important_range": 3,
+        "range": 50,
+        "label_range": 50,
+        "label_important_range": 25,
         "color": "223,223,0",
     },
     {
-        "name": "suburb_point",
+        "name": "suburb_major_point",
         "level_of_detail": 4,
         "dataset": "osm",
         "layer": "suburb_point",
+        "where": "population >= 5000",
         "label": "name",
-        "range": 3,
-        "label_range": 1,
+        "range": 25,
+        "label_range": 25,
         "color": "223,223,0",
     },
     {
-        "name": "village_point",
+        "name": "suburb_medium_point",
+        "level_of_detail": 4,
+        "dataset": "osm",
+        "layer": "suburb_point",
+        "where": "population >= 1000 AND population < 5000",
+        "label": "name",
+        "range": 10,
+        "label_range": 10,
+        "color": "223,223,0",
+    },
+    {
+        "name": "suburb_local_point",
+        "level_of_detail": 4,
+        "dataset": "osm",
+        "layer": "suburb_point",
+        "where": "population < 1000",
+        "label": "name",
+        "range": 3,
+        "label_range": 3,
+        "color": "223,223,0",
+    },
+    {
+        "name": "village_major_point",
         "level_of_detail": 3,
         "dataset": "osm",
         "layer": "village_point",
+        "where": "population >= 5000",
+        "label": "name",
+        "range": 25,
+        "label_range": 25,
+        "color": "223,223,0",
+    },
+    {
+        "name": "village_medium_point",
+        "level_of_detail": 3,
+        "dataset": "osm",
+        "layer": "village_point",
+        "where": "population >= 1000 AND population < 5000",
+        "label": "name",
+        "range": 10,
+        "label_range": 10,
+        "color": "223,223,0",
+    },
+    {
+        "name": "village_local_point",
+        "level_of_detail": 3,
+        "dataset": "osm",
+        "layer": "village_point",
+        "where": "population < 1000",
         "label": "name",
         "range": 3,
-        "label_range": 2,
+        "label_range": 3,
         "color": "223,223,0",
     },
     {
@@ -482,7 +527,61 @@ def source_dataset_path(extract_dir: Path, package: SourcePackage) -> Path:
     return extract_dir
 
 
-def source_layer_path_or_name(source_root: Path, package: SourcePackage, layer_name: str) -> Optional[Tuple[Path, str]]:
+def prepare_pbf_places(pbf: Path, extract_dir: Path) -> Path:
+    out_dir = extract_dir / "pbf_places"
+    marker = out_dir / ".done"
+    layer = out_dir / "pbf_place_point.shp"
+    if marker.exists() and layer.exists():
+        return out_dir
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sql = (
+        "SELECT osm_id, name, place AS fclass, geometry, "
+        "CAST(COALESCE(hstore_get_value(other_tags, 'population'), '0') AS INTEGER) "
+        "AS population FROM points "
+        "WHERE place IN ('city','town','suburb','village') AND name IS NOT NULL"
+    )
+    run(
+        [
+            "ogr2ogr",
+            "-f",
+            "ESRI Shapefile",
+            str(out_dir),
+            str(pbf),
+            "-dialect",
+            "SQLite",
+            "-sql",
+            sql,
+            "-nln",
+            "pbf_place_point",
+            "-nlt",
+            POINT_NLT,
+            "-lco",
+            "ENCODING=UTF-8",
+            "-skipfailures",
+        ]
+    )
+    marker.write_text("ok\n", encoding="utf-8")
+    return out_dir
+
+
+def source_layer_path_or_name(
+    prepared: PreparedPackage,
+    package: SourcePackage,
+    layer_source: LayerSource,
+) -> Optional[Tuple[Path, str]]:
+    layer_name = layer_source.source_layer
+    if layer_source.source_file == "pbf_places":
+        if prepared.pbf_places_path is None or not prepared.pbf_places_path.exists():
+            return None
+        path = prepared.pbf_places_path / f"{layer_name}.shp"
+        if path.exists():
+            return path, layer_name
+        return None
+
+    source_root = prepared.vector_path
     if package.kind == "gpkg_zip":
         return source_root, layer_name[:-2] if layer_name.endswith("_1") else layer_name
     path = source_root / f"{layer_name}.shp"
@@ -493,14 +592,14 @@ def source_layer_path_or_name(source_root: Path, package: SourcePackage, layer_n
 
 def append_source(
     package: SourcePackage,
-    source_root: Path,
+    prepared: PreparedPackage,
     layer_source: LayerSource,
     tile: Tile,
     dataset_dir: Path,
     out_layer: str,
     append: bool,
 ) -> bool:
-    source = source_layer_path_or_name(source_root, package, layer_source.source_layer)
+    source = source_layer_path_or_name(prepared, package, layer_source)
     if source is None:
         return False
     source_path, source_layer = source
@@ -546,9 +645,12 @@ def append_source(
 def extract_template(old_repo: Path, work_dir: Path) -> Path:
     archive = old_repo / "osm" / "nowa_mapa2.7z"
     if not archive.exists():
-        raise RuntimeError(f"Template archive not found: {archive}")
+        candidates = sorted((old_repo / "osm").glob("*.7z"))
+        if not candidates:
+            raise RuntimeError(f"Template archive not found: {archive}")
+        archive = candidates[0]
     template_root = work_dir / "template"
-    template_dir = template_root / "nowa_mapa2"
+    template_dir = template_root / archive.stem
     if template_dir.exists():
         return template_dir
     template_root.mkdir(parents=True, exist_ok=True)
@@ -570,6 +672,8 @@ def make_empty_from_template(template_dir: Path, dataset_dir: Path, layer_name: 
             str(template),
             "-nln",
             layer_name,
+            "-lco",
+            "ENCODING=UTF-8",
             "-where",
             "1=0",
         ]
@@ -643,7 +747,12 @@ def dedupe_layer(dataset_dir: Path, layer_name: str) -> int:
     tmp_dir.mkdir(parents=True)
 
     tmp_ds = driver.CreateDataSource(str(tmp_dir))
-    tmp_layer = tmp_ds.CreateLayer(layer_name, source_layer.GetSpatialRef(), source_layer.GetGeomType())
+    tmp_layer = tmp_ds.CreateLayer(
+        layer_name,
+        source_layer.GetSpatialRef(),
+        source_layer.GetGeomType(),
+        options=["ENCODING=UTF-8"],
+    )
     for index in range(source_defn.GetFieldCount()):
         tmp_layer.CreateField(clone_field_defn(source_defn.GetFieldDefn(index)))
     tmp_defn = tmp_layer.GetLayerDefn()
@@ -767,7 +876,12 @@ def thin_point_layer(dataset_dir: Path, layer_name: str, min_distance_m: float) 
     tmp_dir.mkdir(parents=True)
 
     tmp_ds = driver.CreateDataSource(str(tmp_dir))
-    tmp_layer = tmp_ds.CreateLayer(layer_name, source_layer.GetSpatialRef(), source_layer.GetGeomType())
+    tmp_layer = tmp_ds.CreateLayer(
+        layer_name,
+        source_layer.GetSpatialRef(),
+        source_layer.GetGeomType(),
+        options=["ENCODING=UTF-8"],
+    )
     for index in range(source_defn.GetFieldCount()):
         tmp_layer.CreateField(clone_field_defn(source_defn.GetFieldDefn(index)))
     tmp_defn = tmp_layer.GetLayerDefn()
@@ -842,6 +956,76 @@ def write_checksums(repo: Path) -> None:
     (repo / "checksums").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
+def build_tile(
+    tile: Tile,
+    package_roots: Dict[str, PreparedPackage],
+    template_dir: Path,
+    work: Path,
+    repo: Path,
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    print(f"== tile {tile.name} bounds={tile.bounds}", flush=True)
+    dataset_parent = work / "datasets"
+    dataset_dir = dataset_parent / tile.name
+    if dataset_dir.exists():
+        shutil.rmtree(dataset_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    counts: Dict[str, int] = {}
+    duplicate_counts: Dict[str, int] = {}
+    spacing_counts: Dict[str, int] = {}
+    for layer_name, layer_sources in LAYER_SOURCES.items():
+        wrote_any = False
+        remove_layer(dataset_dir, layer_name)
+        for package in SOURCES:
+            prepared = package_roots[package.name]
+            for layer_source in layer_sources:
+                wrote_any = (
+                    append_source(
+                        package,
+                        prepared,
+                        layer_source,
+                        tile,
+                        dataset_dir,
+                        layer_name,
+                        wrote_any,
+                    )
+                    or wrote_any
+                )
+        if not has_layer(dataset_dir, layer_name):
+            make_empty_from_template(template_dir, dataset_dir, layer_name)
+        duplicate_counts[layer_name] = dedupe_layer(dataset_dir, layer_name)
+        spacing_counts[layer_name] = thin_point_layer(
+            dataset_dir,
+            layer_name,
+            POINT_SPACING_RULES_M.get(layer_name, 0.0),
+        ) if layer_name in POINT_SPACING_RULES_M else 0
+        counts[layer_name] = ogr_count(dataset_dir / f"{layer_name}.shp", layer_name) or 0
+        print(
+            f"== tile {tile.name}: {layer_name} features={counts[layer_name]} "
+            f"duplicates_removed={duplicate_counts[layer_name]} "
+            f"spacing_removed={spacing_counts[layer_name]}",
+            flush=True,
+        )
+
+    archive = repo / "osm" / f"{tile.name}.7z"
+    if archive.exists():
+        archive.unlink()
+    run(["7zr", "a", "-t7z", "-mx=5", str(archive), tile.name], cwd=dataset_parent)
+
+    dataset = {"name": f"osm/{tile.name}", "bounds": tile.bounds}
+    report = {
+        "name": tile.name,
+        "bounds": tile.bounds,
+        "feature_counts": counts,
+        "duplicates_removed": duplicate_counts,
+        "spacing_removed": spacing_counts,
+        "archive": f"osm/{tile.name}.7z",
+        "archive_size": archive.stat().st_size,
+        "archive_size_text": size_text(archive.stat().st_size),
+    }
+    return dataset, report
+
+
 def build(args: argparse.Namespace) -> None:
     started = time.time()
     args.repo.mkdir(parents=True, exist_ok=True)
@@ -849,92 +1033,62 @@ def build(args: argparse.Namespace) -> None:
     args.sources.mkdir(parents=True, exist_ok=True)
 
     template_dir = extract_template(args.old_repo, args.work)
-    package_roots: Dict[str, Path] = {}
+    package_roots: Dict[str, PreparedPackage] = {}
     source_report = []
     for package in SOURCES:
         archive = args.sources / f"{package.name}.zip"
         print(f"== download source {package.name}", flush=True)
         download(package.url, archive)
+        pbf = args.sources / f"{package.name}.osm.pbf"
+        print(f"== download PBF source {package.name}", flush=True)
+        download(package.pbf_url, pbf)
         extract_dir = args.work / "extract" / package.name
         extract_zip(archive, extract_dir)
         root = source_dataset_path(extract_dir, package)
-        package_roots[package.name] = root
+        pbf_places = prepare_pbf_places(pbf, extract_dir)
+        package_roots[package.name] = PreparedPackage(root, pbf_places)
         source_report.append(
             {
                 "name": package.name,
                 "kind": package.kind,
                 "url": package.url,
+                "pbf_url": package.pbf_url,
                 "size": archive.stat().st_size,
                 "size_text": size_text(archive.stat().st_size),
+                "pbf_size": pbf.stat().st_size,
+                "pbf_size_text": size_text(pbf.stat().st_size),
             }
         )
 
     tiles = compute_tiles()
     repo_osm = args.repo / "osm"
     repo_osm.mkdir(parents=True, exist_ok=True)
-    datasets = []
-    tile_report = []
-    for tile in tiles:
-        print(f"== tile {tile.name} bounds={tile.bounds}", flush=True)
-        dataset_parent = args.work / "datasets"
-        dataset_dir = dataset_parent / tile.name
-        if dataset_dir.exists():
-            shutil.rmtree(dataset_dir)
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        counts: Dict[str, int] = {}
-        duplicate_counts: Dict[str, int] = {}
-        spacing_counts: Dict[str, int] = {}
-        for layer_name, layer_sources in LAYER_SOURCES.items():
-            wrote_any = False
-            remove_layer(dataset_dir, layer_name)
-            for package in SOURCES:
-                source_root = package_roots[package.name]
-                for layer_source in layer_sources:
-                    wrote_any = (
-                        append_source(
-                            package,
-                            source_root,
-                            layer_source,
-                            tile,
-                            dataset_dir,
-                            layer_name,
-                            wrote_any,
-                        )
-                        or wrote_any
-                    )
-            if not has_layer(dataset_dir, layer_name):
-                make_empty_from_template(template_dir, dataset_dir, layer_name)
-            duplicate_counts[layer_name] = dedupe_layer(dataset_dir, layer_name)
-            spacing_counts[layer_name] = thin_point_layer(
-                dataset_dir,
-                layer_name,
-                POINT_SPACING_RULES_M.get(layer_name, 0.0),
-            ) if layer_name in POINT_SPACING_RULES_M else 0
-            counts[layer_name] = ogr_count(dataset_dir / f"{layer_name}.shp", layer_name) or 0
-            print(
-                f"== tile {tile.name}: {layer_name} features={counts[layer_name]} "
-                f"duplicates_removed={duplicate_counts[layer_name]} "
-                f"spacing_removed={spacing_counts[layer_name]}",
-                flush=True,
-            )
-
-        archive = repo_osm / f"{tile.name}.7z"
-        if archive.exists():
-            archive.unlink()
-        run(["7zr", "a", "-t7z", "-mx=5", str(archive), tile.name], cwd=dataset_parent)
-        datasets.append({"name": f"osm/{tile.name}", "bounds": tile.bounds})
-        tile_report.append(
-            {
-                "name": tile.name,
-                "bounds": tile.bounds,
-                "feature_counts": counts,
-                "duplicates_removed": duplicate_counts,
-                "spacing_removed": spacing_counts,
-                "archive": f"osm/{tile.name}.7z",
-                "archive_size": archive.stat().st_size,
-                "archive_size_text": size_text(archive.stat().st_size),
+    jobs = args.jobs if args.jobs and args.jobs > 0 else min(len(tiles), os.cpu_count() or 1)
+    print(f"== building {len(tiles)} tiles with jobs={jobs}", flush=True)
+    results: Dict[str, Tuple[Dict[str, object], Dict[str, object]]] = {}
+    if jobs == 1:
+        for tile in tiles:
+            results[tile.name] = build_tile(tile, package_roots, template_dir, args.work, args.repo)
+    else:
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            futures = {
+                executor.submit(
+                    build_tile,
+                    tile,
+                    package_roots,
+                    template_dir,
+                    args.work,
+                    args.repo,
+                ): tile
+                for tile in tiles
             }
-        )
+            for future in as_completed(futures):
+                tile = futures[future]
+                results[tile.name] = future.result()
+                print(f"== tile {tile.name} complete", flush=True)
+
+    datasets = [results[tile.name][0] for tile in tiles]
+    tile_report = [results[tile.name][1] for tile in tiles]
 
     water_src = args.old_repo / "waterpolygons"
     water_dst = args.repo / "waterpolygons"
@@ -978,6 +1132,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", type=Path, default=Path("/work"))
     parser.add_argument("--old-repo", type=Path, default=Path("/old"))
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=int(os.environ.get("MAPGEN_TILE_BUILD_JOBS", "0")),
+        help="number of source tiles to build in parallel; default uses all useful CPUs",
+    )
     args = parser.parse_args(argv)
     args.sources = args.base / "sources"
     args.work = args.base / "work"

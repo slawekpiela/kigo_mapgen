@@ -11,6 +11,14 @@ from xcsoar.mapgen.filelist import FileList
 __cmd_gdalwarp = "gdalwarp"
 __use_world_file = True
 
+
+def __gdal_env():
+    env = os.environ.copy()
+    env.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
+    env.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 1))
+    return env
+
+
 """
  1) Retrieve tiles
 """
@@ -242,7 +250,7 @@ def __create(dir_temp, tiles, arcseconds_per_pixel, bounds):
     args = [
         __cmd_gdalwarp,
         "-wo",
-        "NUM_THREADS=ALL_CUPS",
+        "NUM_THREADS=ALL_CPUS",
         "-r",
         "cubic",
         "-tr",
@@ -273,7 +281,7 @@ def __create(dir_temp, tiles, arcseconds_per_pixel, bounds):
     args.extend(tiles)
     args.append(output_file)
 
-    subprocess.check_call(args)
+    subprocess.check_call(args, env=__gdal_env())
 
     return output_file
 
@@ -302,7 +310,7 @@ def __convert(dir_temp, input_file, water_file, rc, task_corridor_file=None):
             output_file,
         ]
 
-        subprocess.check_call(args)
+        subprocess.check_call(args, env=__gdal_env())
 
     print("Masking coastlines...")
 
@@ -318,7 +326,7 @@ def __convert(dir_temp, input_file, water_file, rc, task_corridor_file=None):
         output_file,
     ]
 
-    subprocess.check_call(args)
+    subprocess.check_call(args, env=__gdal_env())
 
     output = FileList()
     output.add(output_file, False)
@@ -337,11 +345,13 @@ def __convert(dir_temp, input_file, water_file, rc, task_corridor_file=None):
         "BLOCKYSIZE=256",
         "-co",
         "QUALITY=95",
+        "-co",
+        "NUM_THREADS=ALL_CPUS",
         input_file,
         output_file,
     ]
 
-    subprocess.check_call(args)
+    subprocess.check_call(args, env=__gdal_env())
 
     output = FileList()
     output.add(output_file, False)

@@ -2,10 +2,10 @@
 """HTTP task-map service for Kigo remote map generation.
 
 Kigo posts the active task's extreme points plus its requested bbox.  The
-service first tries a ready XCM cache whose map still leaves the route at least
-20 km from the edge, then builds and caches a high-quality tile-union XCM when
-the task fits in a small source-tile set, and finally falls back to an exact
-bbox mapgen request.
+service first tries a ready standard 3-arcsecond XCM cache whose map still
+leaves the route at least 20 km from the edge, then crops a POL_HighRes-style
+base XCM and injects runway rectangles.  If no base XCM covers the request, it
+falls back to a standard mapgen request.
 """
 
 from __future__ import annotations
@@ -39,29 +39,23 @@ import crop_xcm_corridor as crop
 BASE_MAP_CANDIDATES = (
     "/maps/slawek4.xcm",
     "/maps/slawek5.xcm",
-    "/maps/POL_HighRes_1arcsec.xcm",
     "/maps/POL_HighRes_base.xcm",
+    "/maps/POL_HighRes_1arcsec.xcm",
     "/maps/nowa_mapa2.xcm",
     "/maps/nowa_mapa.xcm",
     "/home/slawek/mapgen-output/slawek4.xcm",
     "/home/slawek/mapgen-output/slawek5.xcm",
-    "/home/slawek/mapgen-output/POL_HighRes_1arcsec.xcm",
     "/home/slawek/mapgen-output/POL_HighRes_base.xcm",
+    "/home/slawek/mapgen-output/POL_HighRes_1arcsec.xcm",
     "/home/slawek/mapgen-output/nowa_mapa2.xcm",
     "/home/slawek/mapgen-output/nowa_mapa.xcm",
 )
 
-TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset(("path_line", "track_line"))
-TASK_MAP_LABEL_TOPOLOGY_ROWS = {
-    "town_point": "town_point,10,,1,223,223,0,1,8,3,255",
-    "suburb_point": "suburb_point,3,,1,223,223,0,1,1,0,255",
-    "village_point": "village_point,3,,1,223,223,0,1,2,0,255",
-}
+TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset()
+TASK_MAP_LABEL_TOPOLOGY_ROWS = {}
 TASK_MAP_FORCED_TOPOLOGY_ROWS = {
-    "airstrip_area": "airstrip_area,10,,1,187,187,204,1,1,1,255",
-    "runway_area": "runway_area,20,,0,25,25,25,1,0,0,255",
-    "runway_casing_line": "runway_casing_line,20,,0,0,0,0,15,0,0,255",
-    "runway_line": "runway_line,20,,0,255,255,255,7,0,0,255",
+    "runway_area": "runway_area,20,,0,255,255,255,1,0,0,255",
+    "runway_line": "runway_line,20,,0,0,0,0,3,0,0,255",
     **TASK_MAP_LABEL_TOPOLOGY_ROWS,
 }
 TASK_MAP_MARGIN_KM = 30.0
@@ -97,30 +91,35 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v8"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v17-pol-highres-base-crop-runways"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
-TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "3000"))
+TASK_MAP_LABEL_SPACING_M = float(os.environ.get("KIGO_TASK_MAP_LABEL_SPACING_M", "0"))
 TASK_MAP_LABEL_POINT_LAYERS = tuple(
     layer.strip()
     for layer in os.environ.get(
         "KIGO_TASK_MAP_LABEL_POINT_LAYERS",
-        "village_point,suburb_point",
+        "village_major_point,village_medium_point,village_local_point,"
+        "suburb_major_point,suburb_medium_point,suburb_local_point",
     ).split(",")
     if layer.strip()
 )
 TASK_MAP_LABEL_LAYER_PRIORITY = {
     "city_point": 0,
     "town_point": 1,
-    "village_point": 2,
-    "suburb_point": 3,
+    "village_major_point": 2,
+    "suburb_major_point": 3,
+    "village_medium_point": 4,
+    "suburb_medium_point": 5,
+    "village_local_point": 6,
+    "suburb_local_point": 7,
 }
 TASK_MAP_SUPPRESSED_NAME_LAYERS = tuple(
     layer.strip()
     for layer in os.environ.get(
         "KIGO_TASK_MAP_SUPPRESSED_NAME_LAYERS",
-        "water_area_large,water_area_small,water_line,stream_line,city_area,forest_area",
+        "",
     ).split(",")
     if layer.strip()
 )
@@ -664,10 +663,7 @@ def runway_polyline_layers(features):
 
     if not centerlines:
         return {}
-    return {
-        "runway_casing_line": centerlines,
-        "runway_line": centerlines,
-    }
+    return {"runway_line": centerlines}
 
 
 def dbf_field_specs(data: bytes):
@@ -1059,6 +1055,13 @@ def bbox_intersects(a, b) -> bool:
     )
 
 
+def bbox_overlaps_area(a, b, epsilon: float = 1e-9) -> bool:
+    return (
+        min(a["east"], b["east"]) - max(a["west"], b["west"]) > epsilon
+        and min(a["north"], b["north"]) - max(a["south"], b["south"]) > epsilon
+    )
+
+
 def bbox_union(boxes):
     boxes = list(boxes)
     if not boxes:
@@ -1128,13 +1131,17 @@ def load_source_tiles() -> tuple[SourceTile, ...]:
 def source_repo_fingerprint() -> str:
     digest = hashlib.sha1()
     digest.update(TASK_MAP_XCM_CACHE_VERSION.encode("ascii"))
-    for name in ("manifest", "checksums"):
-        path = TASK_MAP_SOURCE_REPO / name
-        if not path.exists():
-            digest.update(f"{name}:missing".encode("ascii"))
-            continue
-        digest.update(name.encode("ascii"))
-        digest.update(path.read_bytes())
+    digest.update(b"pol-highres-base-crop-3arcsec-topo")
+    digest.update(f"runway-width:{TASK_MAP_RUNWAY_VISIBLE_WIDTH_M:.3f}".encode("ascii"))
+    tiles = load_source_tiles()
+    if not tiles:
+        digest.update(b"tile-grid:missing")
+    for tile in sorted(tiles, key=lambda item: item.name):
+        digest.update(tile.name.encode("utf-8"))
+        digest.update(
+            ",".join(f"{tile.bbox[key]:.8f}" for key in ("south", "west", "north", "east"))
+            .encode("ascii")
+        )
     return digest.hexdigest()
 
 
@@ -1143,7 +1150,7 @@ def select_source_tile_cache(required_bbox):
     if not tiles:
         return None
 
-    selected = [tile for tile in tiles if bbox_intersects(tile.bbox, required_bbox)]
+    selected = [tile for tile in tiles if bbox_overlaps_area(tile.bbox, required_bbox)]
     if not selected:
         return None
 
@@ -1285,9 +1292,8 @@ def _mapgen_submit(bbox, name):
     form = {
         "name": (name or "task_map")[:80],
         "mail": "",
-        "high_quality": "on",      # 1 arc-second, level-of-detail 4
-        "welt2000": "on",          # airport / airstrip waypoints
-        "omit_path_track_lines": "on",  # exclude clutter paths & tracks
+        "highres": "on",           # standard mapgen topology, 3 arc-second terrain
+        "level_of_detail": "3",
         "selection": "bounds",
         "left":   f"{bbox['west']:.6f}",
         "right":  f"{bbox['east']:.6f}",
@@ -1412,6 +1418,38 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
     return raw, ""
 
 
+def generate_map_from_base(base_map: BaseMap, bbox, runway_features=None):
+    """Crop a POL_HighRes-style base XCM and inject runway layers."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="kigo_base_crop_") as tmp:
+            dst = Path(tmp) / "task_map.xcm"
+            crop.crop_xcm_to_bbox(
+                base_map.path,
+                bbox,
+                dst,
+                excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
+                forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
+                extra_polyline_layers=runway_polyline_layers(runway_features or ()),
+                extra_polygon_layers=runway_polygon_layers(runway_features or ()),
+            )
+            raw = dst.read_bytes()
+    except Exception as exc:
+        print(
+            f"[base-map] crop failed base={base_map.path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None, f"base map crop error: {exc}"
+
+    print(
+        f"[base-map] cropped base={base_map.path.name} bbox={bbox['south']:.4f},"
+        f"{bbox['west']:.4f},{bbox['north']:.4f},{bbox['east']:.4f} bytes={len(raw)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return raw, ""
+
+
 class TaskMapHandler(BaseHTTPRequestHandler):
     server_version = "KigoTaskMapHTTP/1.0"
     base_maps: tuple[BaseMap, ...]
@@ -1529,6 +1567,91 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                 tile_names=metadata.get("tiles") or (),
             )
             return
+
+        try:
+            base_map = select_base_map(self.base_maps, bbox)
+        except Exception as exc:
+            self.log_message(
+                "base-map crop unavailable task=%r bbox=%s error=%r; falling back to mapgen",
+                task_name,
+                bbox_header_text(bbox),
+                str(exc),
+            )
+        else:
+            base_tile_name = base_map.path.name
+            cache_key = xcm_cache_digest(
+                "base-crop",
+                source_key,
+                bbox,
+                (base_tile_name,),
+            )
+            cached = read_cached_xcm(cache_key)
+            if cached is not None:
+                data, metadata, _ = cached
+                self.send_xcm(
+                    data,
+                    bbox=bbox,
+                    task_name=task_name,
+                    map_name=map_name,
+                    task_points=task_points,
+                    runway_features=[None] * int(metadata.get("runways") or 0),
+                    runway_source=str(metadata.get("runway_source") or "cache"),
+                    runway_error="",
+                    map_source="xcm-cache",
+                    cache_status="base-hit",
+                    cache_key=cache_key,
+                    tile_names=(base_tile_name,),
+                )
+                return
+
+            try:
+                runway_features, runway_error, runway_source = fetch_osm_runways(bbox)
+            except Exception as exc:
+                runway_features = []
+                runway_error = str(exc)
+                runway_source = "none"
+
+            data, base_error = generate_map_from_base(
+                base_map,
+                bbox,
+                runway_features=runway_features,
+            )
+            if data is not None:
+                metadata = build_cache_metadata(
+                    "base-crop",
+                    source_key,
+                    bbox,
+                    bbox,
+                    required_bbox,
+                    (base_tile_name,),
+                    len(data),
+                    len(runway_features),
+                    runway_source,
+                )
+                metadata["cache_key"] = cache_key
+                save_cached_xcm(cache_key, data, metadata)
+                self.send_xcm(
+                    data,
+                    bbox=bbox,
+                    task_name=task_name,
+                    map_name=map_name,
+                    task_points=task_points,
+                    runway_features=runway_features,
+                    runway_source=runway_source,
+                    runway_error=runway_error,
+                    map_source=f"base-crop:{base_tile_name}",
+                    cache_status="base-miss-filled",
+                    cache_key=cache_key,
+                    tile_names=(base_tile_name,),
+                )
+                return
+
+            self.log_message(
+                "base-map crop failed task=%r base=%s error=%r; falling back to mapgen",
+                task_name,
+                base_tile_name,
+                base_error,
+            )
 
         tile_cache = select_source_tile_cache(required_bbox)
         if tile_cache is not None:
