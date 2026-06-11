@@ -5,16 +5,6 @@ permissions:
 
 on:
   workflow_dispatch:
-  schedule:
-  - cron: '22 5 22 * *'
-  push:
-    # Publish `master` as Docker `latest` image.
-    branches:
-      - master
-
-    # Publish `v1.2.3` tags as releases.
-    tags:
-      - v*
 
 jobs:
   push:
