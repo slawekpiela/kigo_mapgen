@@ -123,7 +123,13 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v22-small-runway-label-strokes"
+TASK_MAP_DBF_OUTPUT_ENCODING = os.environ.get(
+    "KIGO_TASK_MAP_DBF_OUTPUT_ENCODING", "cp1250"
+)
+TASK_MAP_DBF_OUTPUT_CPG = os.environ.get(
+    "KIGO_TASK_MAP_DBF_OUTPUT_CPG", "CP1250"
+)
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v24-cp1250-dbf-labels-compressed"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -1470,6 +1476,32 @@ def dbf_field_specs(data: bytes):
     return fields, header_len, record_len, data[32:header_len]
 
 
+def dbf_field_layout(data: bytes):
+    if len(data) < 32:
+        return [], 0, 0
+    header_len = struct.unpack_from("<H", data, 8)[0]
+    record_len = struct.unpack_from("<H", data, 10)[0]
+    fields = []
+    field_offset = 1
+    offset = 32
+    while offset + 32 <= header_len and data[offset] != 0x0D:
+        raw = data[offset:offset + 32]
+        name = raw[:11].split(b"\0", 1)[0].decode("latin1", errors="replace").strip()
+        field_type = chr(raw[11]) if raw[11] else ""
+        length = raw[16]
+        fields.append(
+            {
+                "name": name,
+                "type": field_type,
+                "offset": field_offset,
+                "length": length,
+            }
+        )
+        field_offset += length
+        offset += 32
+    return fields, header_len, record_len
+
+
 def dbf_rows(data: bytes):
     fields, header_len, record_len, _ = dbf_field_specs(data)
     if not fields or record_len <= 0:
@@ -1710,6 +1742,138 @@ def blank_runway_pair_label_fields(dbf: bytes):
     return bytes(out), changed
 
 
+def dbf_output_ldid():
+    raw = os.environ.get("KIGO_TASK_MAP_DBF_OUTPUT_LDID", "200").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        return None
+    if 0 <= value <= 255:
+        return value
+    return None
+
+
+def encode_dbf_text_to_field(text: str, encoding: str, length: int) -> bytes:
+    text = text.rstrip()
+    while text:
+        encoded = text.encode(encoding, errors="replace")
+        if len(encoded) <= length:
+            return encoded.ljust(length, b" ")
+        text = text[:-1]
+    return b" " * length
+
+
+def recode_dbf_text_fields(dbf: bytes, encoding: str):
+    fields, header_len, record_len = dbf_field_layout(dbf)
+    if not fields or record_len <= 0:
+        return dbf, {"records": 0, "fields": 0}
+
+    out = bytearray(dbf)
+    ldid = dbf_output_ldid()
+    if ldid is not None and len(out) > 29:
+        out[29] = ldid
+
+    count = struct.unpack_from("<I", dbf, 4)[0]
+    changed_records = 0
+    changed_fields = 0
+    text_fields = [field for field in fields if field["type"].upper() == "C"]
+
+    for index in range(count):
+        start = header_len + index * record_len
+        end = start + record_len
+        if end > len(out):
+            break
+        if out[start:start + 1] == b"*":
+            continue
+
+        changed_row = False
+        for field in text_fields:
+            field_start = start + field["offset"]
+            field_end = field_start + field["length"]
+            raw_value = bytes(out[field_start:field_end])
+            if not raw_value.strip():
+                continue
+
+            try:
+                text = raw_value.rstrip(b" \0").decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            encoded = encode_dbf_text_to_field(text, encoding, field["length"])
+            if encoded == raw_value:
+                continue
+
+            out[field_start:field_end] = encoded
+            changed_row = True
+            changed_fields += 1
+
+        if changed_row:
+            changed_records += 1
+
+    return bytes(out), {"records": changed_records, "fields": changed_fields}
+
+
+def rewrite_xcm_dbf_encoding(xcm_bytes: bytes):
+    if not TASK_MAP_DBF_OUTPUT_ENCODING:
+        return xcm_bytes, {}
+
+    cpg_payload = (TASK_MAP_DBF_OUTPUT_CPG.rstrip() + "\n").encode("ascii", errors="replace")
+    with tempfile.TemporaryDirectory(prefix="kigo_dbf_encoding_") as tmp:
+        src_path = Path(tmp) / "src.xcm"
+        dst_path = Path(tmp) / "dst.xcm"
+        src_path.write_bytes(xcm_bytes)
+
+        replacements = {}
+        stats = {"encoding": TASK_MAP_DBF_OUTPUT_ENCODING, "layers": {}}
+        with zipfile.ZipFile(src_path) as zin:
+            names = set(zin.namelist())
+            for info in zin.infolist():
+                if not info.filename.lower().endswith(".dbf"):
+                    continue
+
+                recoded, layer_stats = recode_dbf_text_fields(
+                    zin.read(info.filename),
+                    TASK_MAP_DBF_OUTPUT_ENCODING,
+                )
+                cpg_name = info.filename[:-4] + ".cpg"
+                cpg_changed = cpg_name not in names or zin.read(cpg_name) != cpg_payload
+                if layer_stats["fields"] > 0 or cpg_changed:
+                    replacements[info.filename] = recoded
+                    replacements[cpg_name] = cpg_payload
+                    stats["layers"][Path(info.filename).stem] = layer_stats
+
+            if not replacements:
+                return xcm_bytes, {}
+
+            written = set()
+            with zipfile.ZipFile(dst_path, "w") as zout:
+                for info in zin.infolist():
+                    if info.filename in replacements:
+                        new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                        new_info.external_attr = info.external_attr
+                        new_info.compress_type = info.compress_type
+                        zout.writestr(new_info, replacements[info.filename])
+                        written.add(info.filename)
+                        continue
+                    new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                    new_info.external_attr = info.external_attr
+                    new_info.compress_type = info.compress_type
+                    with zin.open(info) as src, zout.open(new_info, "w") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+                    written.add(info.filename)
+
+                for name, payload in replacements.items():
+                    if name in written:
+                        continue
+                    new_info = zipfile.ZipInfo(name)
+                    new_info.compress_type = zipfile.ZIP_DEFLATED
+                    zout.writestr(new_info, payload)
+
+        return dst_path.read_bytes(), stats
+
+
 def rewrite_topology_template_bytes(
     topology: bytes,
     forced_rows: dict[str, str],
@@ -1931,6 +2095,21 @@ def postprocess_task_xcm(raw: bytes, context: str):
     except Exception as exc:
         print(
             f"[{context}] runway pair label strip failed (returning unstripped map): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    try:
+        raw, encoding_stats = rewrite_xcm_dbf_encoding(raw)
+        if encoding_stats:
+            print(
+                f"[{context}] dbf encoding stats={json.dumps(encoding_stats, sort_keys=True)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[{context}] dbf encoding rewrite failed (returning original encoding): {exc}",
             file=sys.stderr,
             flush=True,
         )
@@ -2163,6 +2342,16 @@ def save_cached_xcm(cache_key: str, data: bytes, metadata: dict) -> None:
     )
     os.replace(tmp_xcm, xcm_path)
     os.replace(tmp_meta, meta_path)
+
+
+def prepare_cached_xcm(data: bytes, metadata: dict, cache_key: str, context: str) -> bytes:
+    prepared = postprocess_task_xcm(data, context)
+    if prepared != data and cache_key:
+        metadata = dict(metadata)
+        metadata["bytes"] = len(prepared)
+        metadata["postprocessed_epoch"] = time.time()
+        save_cached_xcm(cache_key, prepared, metadata)
+    return prepared
 
 
 def build_cache_metadata(kind: str, source_key: str, bbox, request_bbox,
@@ -2475,6 +2664,12 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         cached = find_covering_cached_xcm(required_bbox, source_key)
         if cached is not None:
             data, metadata, _ = cached
+            data = prepare_cached_xcm(
+                data,
+                metadata,
+                str(metadata.get("cache_key") or ""),
+                "xcm-cache",
+            )
             cached_bbox = metadata.get("bbox") if isinstance(metadata.get("bbox"), dict) else bbox
             self.send_xcm(
                 data,
@@ -2512,6 +2707,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             cached = read_cached_xcm(cache_key)
             if cached is not None:
                 data, metadata, _ = cached
+                data = prepare_cached_xcm(data, metadata, cache_key, "xcm-cache")
                 self.send_xcm(
                     data,
                     bbox=bbox,
@@ -2585,6 +2781,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             cached = read_cached_xcm(cache_key)
             if cached is not None:
                 data, metadata, _ = cached
+                data = prepare_cached_xcm(data, metadata, cache_key, "xcm-cache")
                 self.send_xcm(
                     data,
                     bbox=cache_bbox,
@@ -2654,6 +2851,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         cached = read_cached_xcm(exact_key)
         if cached is not None:
             data, metadata, _ = cached
+            data = prepare_cached_xcm(data, metadata, exact_key, "xcm-cache")
             self.send_xcm(
                 data,
                 bbox=bbox,
