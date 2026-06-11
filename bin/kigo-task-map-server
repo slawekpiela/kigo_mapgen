@@ -19,6 +19,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import sys
@@ -63,6 +64,7 @@ TASK_MAP_LABEL_TOPOLOGY_ROWS = {}
 TASK_MAP_FORCED_TOPOLOGY_ROWS = {
     "runway_area": "runway_area,20,,0,255,255,255,1,0,0,255",
     "runway_line": "runway_line,20,,0,0,0,0,3,0,0,255",
+    "runway_label_point": "runway_label_point,20,,1,0,0,0,1,20,0,255",
     **TASK_MAP_LABEL_TOPOLOGY_ROWS,
 }
 TASK_MAP_MARGIN_KM = 30.0
@@ -92,13 +94,33 @@ TASK_MAP_XCM_CACHE_DIR = Path(
 TASK_MAP_SOURCE_REPO = Path(
     os.environ.get("KIGO_TASK_MAP_SOURCE_REPO", "/opt/mapgen/high-quality-data")
 )
+TASK_MAP_OPENAIP_AIRPORTS_PATHS = tuple(
+    Path(path.strip())
+    for path in os.environ.get("KIGO_TASK_MAP_OPENAIP_AIRPORTS", "").replace(";", ",").split(",")
+    if path.strip()
+) or (
+    TASK_MAP_SOURCE_REPO / "openaip-airports.json",
+    TASK_MAP_SOURCE_REPO / "openaip_airports.json",
+    TASK_MAP_SOURCE_REPO / "openaip" / "airports.json",
+    TASK_MAP_SOURCE_REPO / "openaip" / "airports.geojson",
+    Path("/app/openaip/airports.json"),
+    Path("/app/openaip"),
+    Path("/maps/openaip/airports.json"),
+    Path("/maps/openaip/airports.geojson"),
+)
+TASK_MAP_OPENAIP_MATCH_RADIUS_M = float(
+    os.environ.get("KIGO_TASK_MAP_OPENAIP_MATCH_RADIUS_M", "5000")
+)
+TASK_MAP_OPENAIP_HEADING_TOLERANCE_DEG = float(
+    os.environ.get("KIGO_TASK_MAP_OPENAIP_HEADING_TOLERANCE_DEG", "25")
+)
 TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
     os.environ.get("KIGO_TASK_MAP_ROUTE_TILE_MARGIN_KM", "20")
 )
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v17-pol-highres-base-crop-runways"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v19-openaip-runway-threshold-labels"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -130,6 +152,7 @@ TASK_MAP_SUPPRESSED_NAME_LAYERS = tuple(
     ).split(",")
     if layer.strip()
 )
+_OPENAIP_AIRPORTS = None
 
 
 @dataclass(frozen=True)
@@ -335,6 +358,368 @@ def runway_width_m(tags) -> float:
     return 45.0
 
 
+def numeric_meters(value):
+    if value is None:
+        return None
+
+    unit = None
+    if isinstance(value, dict):
+        unit = value.get("unit") or value.get("uom")
+        for key in ("value", "val", "meters", "metres", "m"):
+            if key in value:
+                value = value.get(key)
+                break
+        else:
+            return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        text = ""
+    else:
+        text = str(value).strip().lower().replace(",", ".")
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        number = float(match.group(0))
+
+    unit_text = str(unit or "").strip().lower()
+    if "ft" in unit_text or "feet" in unit_text or "foot" in unit_text:
+        number *= 0.3048
+    elif not unit_text and isinstance(value, str):
+        if "ft" in text or "feet" in text or "foot" in text:
+            number *= 0.3048
+
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def nested_value(root, paths):
+    for path in paths:
+        value = root
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def openaip_runway_dimensions(runway):
+    length = numeric_meters(
+        nested_value(
+            runway,
+            (
+                ("dimensions", "length"),
+                ("dimension", "length"),
+                ("length",),
+                ("length_m",),
+                ("lengthMeters",),
+                ("lengthMetres",),
+                ("runwayLength",),
+                ("runway_length",),
+            ),
+        )
+    )
+    width = numeric_meters(
+        nested_value(
+            runway,
+            (
+                ("dimensions", "width"),
+                ("dimension", "width"),
+                ("width",),
+                ("width_m",),
+                ("widthMeters",),
+                ("widthMetres",),
+                ("runwayWidth",),
+                ("runway_width",),
+            ),
+        )
+    )
+
+    if length is not None and not 20 <= length <= 8000:
+        length = None
+    if width is not None and not 1 <= width <= 300:
+        width = None
+    return length, width
+
+
+def ordered_runway_designator_tokens(value):
+    text = str(value or "").upper().replace("\\", "/").replace("-", "/")
+    text = text.replace("RWY", " ")
+    tokens = []
+    seen = set()
+    for number, suffix in re.findall(r"\b([0-3]?\d)([LCR]?)\b", text):
+        runway_number = int(number)
+        if runway_number == 0 or runway_number > 36:
+            continue
+        token = f"{runway_number:02d}{suffix}"
+        if token not in seen:
+            tokens.append(token)
+            seen.add(token)
+    return tuple(tokens)
+
+
+def runway_designator_tokens(value):
+    return set(ordered_runway_designator_tokens(value))
+
+
+def runway_designator_heading_360(token):
+    match = re.match(r"(\d{2})", str(token or "").upper())
+    if not match:
+        return None
+    return (int(match.group(1)) * 10.0) % 360.0
+
+
+def opposite_runway_designator(token):
+    text = str(token or "").upper()
+    match = re.match(r"(\d{2})([LCR]?)", text)
+    if not match:
+        return None
+    runway_number = int(match.group(1))
+    if runway_number == 0 or runway_number > 36:
+        return None
+    opposite_number = ((runway_number + 18 - 1) % 36) + 1
+    suffix = {"L": "R", "R": "L"}.get(match.group(2), match.group(2))
+    return f"{opposite_number:02d}{suffix}"
+
+
+def runway_heading_from_designator(value):
+    tokens = ordered_runway_designator_tokens(value)
+    if not tokens:
+        return None
+    heading = runway_designator_heading_360(tokens[0])
+    return None if heading is None else heading % 180.0
+
+
+def normalise_heading_180(value):
+    if isinstance(value, dict):
+        for key in ("value", "val", "degrees", "degree"):
+            if key in value:
+                value = value.get(key)
+                break
+        else:
+            return None
+
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        heading = float(value)
+    else:
+        text = str(value).strip().lower().replace(",", ".")
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        heading = float(match.group(0))
+
+    if not math.isfinite(heading):
+        return None
+    return heading % 180.0
+
+
+def angle_diff_180(a, b):
+    diff = abs((float(a) % 180.0) - (float(b) % 180.0))
+    return min(diff, 180.0 - diff)
+
+
+def angle_diff_360(a, b):
+    diff = abs((float(a) % 360.0) - (float(b) % 360.0))
+    return min(diff, 360.0 - diff)
+
+
+def openaip_runway_label(runway):
+    for key in ("designator", "name", "ident", "identifier", "ref"):
+        value = runway.get(key) if isinstance(runway, dict) else None
+        if value:
+            return str(value)
+    return ""
+
+
+def openaip_runway_heading(runway, label):
+    value = nested_value(
+        runway,
+        (
+            ("trueHeading",),
+            ("true_heading",),
+            ("heading",),
+            ("magneticHeading",),
+            ("magnetic_heading",),
+            ("direction",),
+        ),
+    )
+    heading = normalise_heading_180(value)
+    if heading is not None:
+        return heading
+    return runway_heading_from_designator(label)
+
+
+def openaip_record_coordinates(record):
+    geometry = record.get("_geometry") or record.get("geometry") or record.get("location")
+    if isinstance(geometry, dict):
+        coordinates = geometry.get("coordinates")
+        if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
+            try:
+                return float(coordinates[0]), float(coordinates[1])
+            except (TypeError, ValueError):
+                pass
+        lon = geometry.get("lon") or geometry.get("lng") or geometry.get("longitude")
+        lat = geometry.get("lat") or geometry.get("latitude")
+        if lon is not None and lat is not None:
+            try:
+                return float(lon), float(lat)
+            except (TypeError, ValueError):
+                pass
+
+    coordinates = record.get("coordinates")
+    if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
+        try:
+            return float(coordinates[0]), float(coordinates[1])
+        except (TypeError, ValueError):
+            pass
+    if isinstance(coordinates, dict):
+        lon = coordinates.get("lon") or coordinates.get("lng") or coordinates.get("longitude")
+        lat = coordinates.get("lat") or coordinates.get("latitude")
+        if lon is not None and lat is not None:
+            try:
+                return float(lon), float(lat)
+            except (TypeError, ValueError):
+                pass
+
+    lon = (
+        record.get("lon")
+        or record.get("lng")
+        or record.get("longitude")
+        or record.get("long")
+    )
+    lat = record.get("lat") or record.get("latitude")
+    if lon is None or lat is None:
+        return None
+
+    try:
+        return float(lon), float(lat)
+    except (TypeError, ValueError):
+        return None
+
+
+def iter_openaip_airport_records(payload):
+    if isinstance(payload, list):
+        for item in payload:
+            yield from iter_openaip_airport_records(item)
+        return
+
+    if not isinstance(payload, dict):
+        return
+
+    features = payload.get("features")
+    if isinstance(features, list):
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            record = dict(feature.get("properties") or {})
+            for key in ("runways", "rwys"):
+                if key in feature and key not in record:
+                    record[key] = feature.get(key)
+            if "geometry" in feature:
+                record["_geometry"] = feature.get("geometry")
+            yield from iter_openaip_airport_records(record)
+        return
+
+    for key in ("airports", "items", "data", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            for item in value:
+                yield from iter_openaip_airport_records(item)
+            return
+
+    if isinstance(payload.get("runways") or payload.get("rwys"), list):
+        yield payload
+
+
+def normalise_openaip_airport(record):
+    coordinates = openaip_record_coordinates(record)
+    if coordinates is None:
+        return None
+
+    runways = []
+    raw_runways = record.get("runways") or record.get("rwys") or ()
+    if isinstance(raw_runways, dict):
+        raw_runways = raw_runways.values()
+    for runway in raw_runways:
+        if not isinstance(runway, dict):
+            continue
+        length, width = openaip_runway_dimensions(runway)
+        if length is None and width is None:
+            continue
+        label = openaip_runway_label(runway)
+        runways.append(
+            {
+                "label": label,
+                "tokens": runway_designator_tokens(label),
+                "heading": openaip_runway_heading(runway, label),
+                "length_m": length,
+                "width_m": width,
+            }
+        )
+
+    if not runways:
+        return None
+
+    return {
+        "name": str(record.get("name") or record.get("title") or ""),
+        "icao": str(
+            record.get("icaoCode")
+            or record.get("icao")
+            or record.get("icao_code")
+            or ""
+        ),
+        "point": coordinates,
+        "runways": tuple(runways),
+    }
+
+
+def openaip_payload_paths():
+    paths = []
+    for path in TASK_MAP_OPENAIP_AIRPORTS_PATHS:
+        if path.is_file():
+            paths.append(path)
+        elif path.is_dir():
+            paths.extend(sorted(path.rglob("*.json")))
+            paths.extend(sorted(path.rglob("*.geojson")))
+    return tuple(dict.fromkeys(paths))
+
+
+def load_openaip_airports():
+    global _OPENAIP_AIRPORTS
+    if _OPENAIP_AIRPORTS is not None:
+        return _OPENAIP_AIRPORTS
+
+    airports = []
+    for path in openaip_payload_paths():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[openaip] skipped {path}: {exc}", file=sys.stderr, flush=True)
+            continue
+
+        for record in iter_openaip_airport_records(payload):
+            airport = normalise_openaip_airport(record)
+            if airport is not None:
+                airports.append(airport)
+
+    _OPENAIP_AIRPORTS = tuple(airports)
+    if _OPENAIP_AIRPORTS:
+        print(
+            f"[openaip] loaded {len(_OPENAIP_AIRPORTS)} airports from "
+            f"{len(openaip_payload_paths())} file(s)",
+            file=sys.stderr,
+            flush=True,
+        )
+    return _OPENAIP_AIRPORTS
+
+
 def osm_runway_query(bbox):
     query_timeout = max(20, int(TASK_MAP_OVERPASS_TIMEOUT_S))
     return (
@@ -348,18 +733,21 @@ def osm_runway_query(bbox):
 def fetch_osm_runways(bbox):
     cached = load_cached_runways(bbox)
     if cached is not None:
-        return cached, "", "cache"
+        features, openaip_count = enrich_runways_with_openaip(cached, bbox)
+        return features, "", runway_source_label("cache", openaip_count)
 
     try:
         features = fetch_osm_runways_from_overpass(bbox)
     except Exception as exc:
         cached = load_cached_runways(bbox)
         if cached is not None:
-            return cached, str(exc), "cache-after-error"
+            features, openaip_count = enrich_runways_with_openaip(cached, bbox)
+            return features, str(exc), runway_source_label("cache-after-error", openaip_count)
         raise
 
     save_cached_runways(bbox, features)
-    return features, "", "overpass"
+    features, openaip_count = enrich_runways_with_openaip(features, bbox)
+    return features, "", runway_source_label("overpass", openaip_count)
 
 
 def fetch_osm_runways_from_overpass(bbox):
@@ -491,6 +879,8 @@ def normalise_cached_features(raw):
                 "label": str(feature.get("label") or ""),
                 "points": points,
                 "width_m": float(feature.get("width_m") or 45.0),
+                "length_m": feature.get("length_m"),
+                "dimensions_source": str(feature.get("dimensions_source") or ""),
             }
         )
     return features
@@ -535,6 +925,8 @@ def save_cached_runways(bbox, features):
                     "label": feature.get("label") or "",
                     "points": feature.get("points") or [],
                     "width_m": feature.get("width_m") or 45.0,
+                    "length_m": feature.get("length_m"),
+                    "dimensions_source": feature.get("dimensions_source") or "",
                 }
                 for feature in features or ()
             ],
@@ -618,18 +1010,13 @@ def runway_centerline_points(feature):
     ]
 
 
-def runway_centerline_feature(feature):
-    points = runway_centerline_points(feature)
-    if points is None:
-        return None
-    return {
-        "label": feature.get("label") or "",
-        "points": points,
-        "width_m": feature.get("width_m") or 45.0,
-    }
+def runway_source_label(base_source, openaip_count):
+    if openaip_count:
+        return f"{base_source}+openaip:{openaip_count}"
+    return base_source
 
 
-def runway_area_polygon(feature):
+def runway_centerline_measurement(feature):
     points = runway_centerline_points(feature)
     if points is None or len(points) < 2:
         return None
@@ -645,10 +1032,203 @@ def runway_area_polygon(feature):
     if length <= 0:
         return None
 
-    width_m = max(
-        float(feature.get("width_m") or 45.0),
-        TASK_MAP_RUNWAY_VISIBLE_WIDTH_M,
+    return {
+        "points": points,
+        "midpoint": ((lon1 + lon2) / 2.0, (lat1 + lat2) / 2.0),
+        "heading": math.degrees(math.atan2(dx, dy)) % 180.0,
+        "length_m": length,
+    }
+
+
+def openaip_airports_near_bbox(bbox, airports):
+    margin = TASK_MAP_OPENAIP_MATCH_RADIUS_M / 111320.0 + 0.05
+    south = bbox["south"] - margin
+    west = bbox["west"] - margin
+    north = bbox["north"] + margin
+    east = bbox["east"] + margin
+    return tuple(
+        airport
+        for airport in airports
+        if west <= airport["point"][0] <= east and south <= airport["point"][1] <= north
     )
+
+
+def match_openaip_runway(feature, airports):
+    measurement = runway_centerline_measurement(feature)
+    if measurement is None:
+        return None
+
+    label_tokens = runway_designator_tokens(feature.get("label"))
+    best = None
+    for airport in airports:
+        airport_distance_m = math.sqrt(
+            geodesic_distance_sq_m(measurement["midpoint"], airport["point"])
+        )
+        if airport_distance_m > TASK_MAP_OPENAIP_MATCH_RADIUS_M:
+            continue
+
+        single_runway_airport = len(airport["runways"]) == 1
+        for runway in airport["runways"]:
+            heading_diff = None
+            if runway["heading"] is not None:
+                heading_diff = angle_diff_180(measurement["heading"], runway["heading"])
+
+            token_match = bool(
+                label_tokens and runway["tokens"] and label_tokens.intersection(runway["tokens"])
+            )
+            token_conflict = bool(label_tokens and runway["tokens"] and not token_match)
+            if token_conflict:
+                continue
+
+            heading_match = (
+                heading_diff is not None
+                and heading_diff <= TASK_MAP_OPENAIP_HEADING_TOLERANCE_DEG
+            )
+            fallback_match = single_runway_airport and not label_tokens
+            if not (token_match or heading_match or fallback_match):
+                continue
+
+            length_penalty = 0.0
+            if runway["length_m"] is not None:
+                length_penalty = min(
+                    abs(runway["length_m"] - measurement["length_m"]),
+                    2000.0,
+                ) / 5.0
+
+            score = airport_distance_m + length_penalty
+            if heading_diff is not None:
+                score += heading_diff * 50.0
+
+            candidate = (score, airport, runway)
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+
+    if best is None:
+        return None
+
+    _, airport, runway = best
+    return {
+        "airport": airport,
+        "runway": runway,
+    }
+
+
+def enrich_runways_with_openaip(features, bbox):
+    airports = load_openaip_airports()
+    if not airports:
+        return list(features or ()), 0
+
+    nearby_airports = openaip_airports_near_bbox(bbox, airports)
+    if not nearby_airports:
+        return list(features or ()), 0
+
+    enriched = []
+    enriched_count = 0
+    for feature in features or ():
+        match = match_openaip_runway(feature, nearby_airports)
+        if match is None:
+            enriched.append(feature)
+            continue
+
+        runway = match["runway"]
+        airport = match["airport"]
+        updated = dict(feature)
+        if runway["length_m"] is not None:
+            updated["length_m"] = runway["length_m"]
+        if runway["width_m"] is not None:
+            updated["width_m"] = runway["width_m"]
+        updated["dimensions_source"] = "openaip"
+        updated["openaip_airport"] = airport.get("icao") or airport.get("name") or ""
+        updated["openaip_runway"] = runway.get("label") or ""
+        if not updated.get("label") and runway.get("label"):
+            updated["label"] = runway.get("label")
+        enriched.append(updated)
+        enriched_count += 1
+
+    return enriched, enriched_count
+
+
+def valid_feature_length_m(feature):
+    length = numeric_meters(feature.get("length_m") if isinstance(feature, dict) else None)
+    if length is None or not 20 <= length <= 8000:
+        return None
+    return length
+
+
+def runway_sized_centerline_points(feature):
+    measurement = runway_centerline_measurement(feature)
+    if measurement is None:
+        return None
+
+    length_m = valid_feature_length_m(feature)
+    if length_m is None:
+        return measurement["points"]
+
+    (lon1, lat1), (lon2, lat2) = measurement["points"]
+    mean_lat = (lat1 + lat2) / 2.0
+    meters_per_lat = 111320.0
+    meters_per_lon = max(1.0, meters_per_lat * math.cos(math.radians(mean_lat)))
+    dx = (lon2 - lon1) * meters_per_lon
+    dy = (lat2 - lat1) * meters_per_lat
+    current_length = math.hypot(dx, dy)
+    if current_length <= 0:
+        return measurement["points"]
+
+    ux = dx / current_length
+    uy = dy / current_length
+    center_x = ((lon1 + lon2) / 2.0 - lon1) * meters_per_lon
+    center_y = ((lat1 + lat2) / 2.0 - lat1) * meters_per_lat
+    half_length = length_m / 2.0
+    start_x = center_x - ux * half_length
+    start_y = center_y - uy * half_length
+    end_x = center_x + ux * half_length
+    end_y = center_y + uy * half_length
+
+    return [
+        (lon1 + start_x / meters_per_lon, lat1 + start_y / meters_per_lat),
+        (lon1 + end_x / meters_per_lon, lat1 + end_y / meters_per_lat),
+    ]
+
+
+def runway_draw_width_m(feature):
+    width_m = numeric_meters(feature.get("width_m") if isinstance(feature, dict) else None)
+    if width_m is None or not 1 <= width_m <= 300:
+        width_m = 45.0
+
+    if isinstance(feature, dict) and feature.get("dimensions_source") == "openaip":
+        return width_m
+
+    return max(width_m, TASK_MAP_RUNWAY_VISIBLE_WIDTH_M)
+
+
+def runway_centerline_feature(feature):
+    points = runway_sized_centerline_points(feature)
+    if points is None:
+        return None
+    return {
+        "label": feature.get("label") or "",
+        "points": points,
+        "width_m": feature.get("width_m") or 45.0,
+    }
+
+
+def runway_area_polygon(feature):
+    points = runway_sized_centerline_points(feature)
+    if points is None or len(points) < 2:
+        return None
+
+    lon1, lat1 = points[0]
+    lon2, lat2 = points[-1]
+    mean_lat = (lat1 + lat2) / 2.0
+    meters_per_lat = 111320.0
+    meters_per_lon = max(1.0, meters_per_lat * math.cos(math.radians(mean_lat)))
+    dx = (lon2 - lon1) * meters_per_lon
+    dy = (lat2 - lat1) * meters_per_lat
+    length = math.hypot(dx, dy)
+    if length <= 0:
+        return None
+
+    width_m = runway_draw_width_m(feature)
     half_width = width_m / 2.0
     ux = -dy / length
     uy = dx / length
@@ -688,6 +1268,98 @@ def runway_polyline_layers(features):
     if not centerlines:
         return {}
     return {"runway_line": centerlines}
+
+
+def runway_threshold_tokens(feature):
+    tokens = ()
+    for value in (
+        feature.get("label") if isinstance(feature, dict) else "",
+        feature.get("openaip_runway") if isinstance(feature, dict) else "",
+    ):
+        tokens = ordered_runway_designator_tokens(value)
+        if tokens:
+            break
+
+    if len(tokens) == 1:
+        opposite = opposite_runway_designator(tokens[0])
+        if opposite and opposite not in tokens:
+            tokens = (tokens[0], opposite)
+
+    return tokens[:2]
+
+
+def runway_threshold_label_points(feature):
+    points = runway_sized_centerline_points(feature)
+    if points is None or len(points) < 2:
+        return []
+
+    token_headings = []
+    for token in runway_threshold_tokens(feature):
+        heading = runway_designator_heading_360(token)
+        if heading is not None:
+            token_headings.append((token, heading))
+    if not token_headings:
+        return []
+
+    (lon1, lat1), (lon2, lat2) = points[0], points[-1]
+    mean_lat = (lat1 + lat2) / 2.0
+    meters_per_lat = 111320.0
+    meters_per_lon = max(1.0, meters_per_lat * math.cos(math.radians(mean_lat)))
+    dx = (lon2 - lon1) * meters_per_lon
+    dy = (lat2 - lat1) * meters_per_lat
+    length = math.hypot(dx, dy)
+    if length <= 0:
+        return []
+
+    ux = dx / length
+    uy = dy / length
+    start_heading = math.degrees(math.atan2(dx, dy)) % 360.0
+    end_heading = (start_heading + 180.0) % 360.0
+    labels = [None, None]
+    remaining = list(token_headings)
+    for endpoint_index, endpoint_heading in ((0, start_heading), (1, end_heading)):
+        if not remaining:
+            break
+        best_index = min(
+            range(len(remaining)),
+            key=lambda index: angle_diff_360(remaining[index][1], endpoint_heading),
+        )
+        labels[endpoint_index] = remaining.pop(best_index)[0]
+
+    offset_m = max(65.0, runway_draw_width_m(feature) * 0.6)
+
+    def project(local_x, local_y):
+        return (
+            lon1 + local_x / meters_per_lon,
+            lat1 + local_y / meters_per_lat,
+        )
+
+    label_points = []
+    if labels[0]:
+        label_points.append(
+            {
+                "label": labels[0],
+                "point": project(-ux * offset_m, -uy * offset_m),
+            }
+        )
+    if labels[1]:
+        label_points.append(
+            {
+                "label": labels[1],
+                "point": project(dx + ux * offset_m, dy + uy * offset_m),
+            }
+        )
+    return label_points
+
+
+def runway_point_layers(features):
+    label_points = []
+    for feature in features or ():
+        label_points.extend(runway_threshold_label_points(feature))
+
+    if not label_points:
+        return {}
+    return {"runway_label_point": label_points}
 
 
 def dbf_field_specs(data: bytes):
@@ -1319,6 +1991,7 @@ def _mapgen_submit(bbox, name):
     """POST to mapgen and return job UUID.  Raises on failure."""
     form = {
         "name": (name or "task_map")[:80],
+        "mail": "",
         "highres": "on",           # standard mapgen topology, 3 arc-second terrain
         "level_of_detail": "3",
         "selection": "bounds",
@@ -1375,6 +2048,18 @@ def _xcm_has_terrain(xcm_bytes):
         return False
 
 
+def _xcm_has_required_map_files(xcm_bytes):
+    """Return True if the XCM has the core files Kigo needs to load it."""
+    try:
+        import io
+        with zipfile.ZipFile(io.BytesIO(xcm_bytes)) as zf:
+            names = set(zf.namelist())
+    except Exception:
+        return False
+
+    return {"terrain.jp2", "terrain.j2w", "topology.tpl"}.issubset(names)
+
+
 def generate_map_from_mapgen(bbox, name, runway_features=None):
     """Generate a new XCM map via mapgen, inject runways, return bytes or None."""
     try:
@@ -1404,6 +2089,14 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
         print(f"[mapgen] download failed {uuid}: {exc}", file=sys.stderr, flush=True)
         return None, f"mapgen download error: {exc}"
 
+    if not _xcm_has_required_map_files(raw):
+        print(
+            f"[mapgen] generated incomplete XCM {uuid} (missing terrain/topology)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None, "mapgen generated incomplete XCM"
+
     # Inject runway polygons into topology if available.
     if runway_features and _xcm_has_terrain(raw):
         try:
@@ -1415,6 +2108,7 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
                     src, bbox, dst,
                     excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
                     forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
+                    extra_point_layers=runway_point_layers(runway_features),
                     extra_polyline_layers=runway_polyline_layers(runway_features),
                     extra_polygon_layers=runway_polygon_layers(runway_features),
                     skip_terrain_crop=True,
@@ -1456,6 +2150,7 @@ def generate_map_from_base(base_map: BaseMap, bbox, runway_features=None):
                 dst,
                 excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
                 forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
+                extra_point_layers=runway_point_layers(runway_features or ()),
                 extra_polyline_layers=runway_polyline_layers(runway_features or ()),
                 extra_polygon_layers=runway_polygon_layers(runway_features or ()),
             )

@@ -624,6 +624,88 @@ def normalise_polyline_feature(feature):
     return {"points": points, "label": label}
 
 
+def normalise_point_feature(feature):
+    if isinstance(feature, dict):
+        raw_point = feature.get("point")
+        if raw_point is None:
+            raw_points = feature.get("points") or []
+            raw_point = raw_points[0] if raw_points else None
+        label = feature.get("label") or ""
+    else:
+        raw_point = feature
+        label = ""
+
+    if raw_point is None:
+        return None
+
+    try:
+        lon, lat = raw_point
+    except Exception:
+        return None
+
+    lon = float(lon)
+    lat = float(lat)
+    if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+        return None
+
+    return {"point": (lon, lat), "label": label}
+
+
+def write_point_shapefile_group(dst_dir: Path, stem: str, features):
+    normalised = []
+    for feature in features or ():
+        item = normalise_point_feature(feature)
+        if item is not None:
+            normalised.append(item)
+
+    if not normalised:
+        return None
+
+    all_points = [item["point"] for item in normalised]
+    bbox = (
+        min(point[0] for point in all_points),
+        min(point[1] for point in all_points),
+        max(point[0] for point in all_points),
+        max(point[1] for point in all_points),
+    )
+
+    records = []
+    for item in normalised:
+        lon, lat = item["point"]
+        content = bytearray()
+        content += struct.pack("<i", 1)
+        content += struct.pack("<dd", lon, lat)
+        records.append(
+            {
+                "content": bytes(content),
+                "length_words": len(content) // 2,
+                "label": item["label"],
+            }
+        )
+
+    shp_length_words = (100 + sum(8 + len(record["content"]) for record in records)) // 2
+    shp_header = shape_header(1, bbox, shp_length_words)
+    with (dst_dir / f"{stem}.shp").open("wb") as out:
+        out.write(shp_header)
+        for number, record in enumerate(records, 1):
+            out.write(struct.pack(">ii", number, record["length_words"]))
+            out.write(record["content"])
+
+    shx_length_words = (100 + len(records) * 8) // 2
+    shx_header = shape_header(1, bbox, shx_length_words)
+    with (dst_dir / f"{stem}.shx").open("wb") as out:
+        out.write(shx_header)
+        offset_words = 50
+        for record in records:
+            out.write(struct.pack(">ii", offset_words, record["length_words"]))
+            offset_words += 4 + record["length_words"]
+
+    write_dbf(dst_dir / f"{stem}.dbf", [record["label"] for record in records])
+    (dst_dir / f"{stem}.prj").write_text(WGS84_PRJ + "\n")
+
+    return {"stem": stem, "features": len(records)}
+
+
 def write_polyline_shapefile_group(dst_dir: Path, stem: str, features):
     normalised = []
     for feature in features or ():
@@ -761,6 +843,18 @@ def write_polygon_shapefile_group(dst_dir: Path, stem: str, features):
     return {"stem": stem, "features": len(records)}
 
 
+def write_extra_point_layers(dst_dir: Path, extra_point_layers=None):
+    stats = []
+    for stem, features in (extra_point_layers or {}).items():
+        stem = str(stem).strip()
+        if not stem:
+            continue
+        stat = write_point_shapefile_group(dst_dir, stem, features)
+        if stat is not None:
+            stats.append(stat)
+    return stats
+
+
 def write_extra_polyline_layers(dst_dir: Path, extra_polyline_layers=None):
     stats = []
     for stem, features in (extra_polyline_layers or {}).items():
@@ -887,6 +981,7 @@ def crop_xcm_to_bbox(
     keep_workdir: bool = False,
     excluded_vector_stems=None,
     forced_topology_rows=None,
+    extra_point_layers=None,
     extra_polyline_layers=None,
     extra_polygon_layers=None,
     corridor_segments=None,
@@ -903,6 +998,7 @@ def crop_xcm_to_bbox(
                 keep_workdir=False,
                 excluded_vector_stems=excluded_vector_stems,
                 forced_topology_rows=forced_topology_rows,
+                extra_point_layers=extra_point_layers,
                 extra_polyline_layers=extra_polyline_layers,
                 extra_polygon_layers=extra_polygon_layers,
                 corridor_segments=corridor_segments,
@@ -927,6 +1023,10 @@ def crop_xcm_to_bbox(
     with zipfile.ZipFile(xcm) as zf:
         zf.extractall(src_dir)
 
+    injected_point_stats = write_extra_point_layers(
+        src_dir,
+        extra_point_layers,
+    )
     injected_vector_stats = write_extra_polyline_layers(
         src_dir,
         extra_polyline_layers,
@@ -970,6 +1070,7 @@ def crop_xcm_to_bbox(
         "terrain_size_mb": terrain_size,
         "output_xcm_mb": format_size(output),
         "excluded_vector_stems": sorted(excluded_stems),
+        "injected_point_stats": injected_point_stats,
         "injected_vector_stats": injected_vector_stats,
         "injected_polygon_stats": injected_polygon_stats,
         "vector_stats": vector_stats,
