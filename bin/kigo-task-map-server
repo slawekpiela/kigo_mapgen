@@ -59,17 +59,20 @@ DEFAULT_BASE_MAP_TILE_DIRS = (
     "/home/slawek/mapgen-output/taskmap-base-tiles",
 )
 
-TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset()
+TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset({"runway_label_point"})
 TASK_MAP_LABEL_TOPOLOGY_ROWS = {}
 TASK_MAP_FORCED_TOPOLOGY_ROWS = {
     "runway_area": "runway_area,20,,0,255,255,255,1,0,0,255",
     "runway_line": "runway_line,20,,0,0,0,0,3,0,0,255",
-    "runway_label_point": "runway_label_point,20,,1,0,0,0,1,20,20,255",
+    "runway_label_line": "runway_label_line,20,,0,0,0,0,6,0,0,255",
     **TASK_MAP_LABEL_TOPOLOGY_ROWS,
 }
 TASK_MAP_MARGIN_KM = 30.0
 TASK_MAP_RUNWAY_VISIBLE_WIDTH_M = float(
     os.environ.get("KIGO_TASK_MAP_RUNWAY_VISIBLE_WIDTH_M", "220")
+)
+TASK_MAP_RUNWAY_LABEL_HEIGHT_M = float(
+    os.environ.get("KIGO_TASK_MAP_RUNWAY_LABEL_HEIGHT_M", "320")
 )
 TASK_MAP_OVERPASS_URLS = tuple(
     url.strip()
@@ -120,7 +123,7 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v20-bold-runway-threshold-labels"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v21-runway-label-strokes"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -1265,9 +1268,15 @@ def runway_polyline_layers(features):
         if centerline is not None:
             centerlines.append(centerline)
 
-    if not centerlines:
-        return {}
-    return {"runway_line": centerlines}
+    layers = {}
+    if centerlines:
+        layers["runway_line"] = centerlines
+
+    label_lines = runway_label_line_features(features)
+    if label_lines:
+        layers["runway_label_line"] = label_lines
+
+    return layers
 
 
 def runway_threshold_tokens(feature):
@@ -1350,6 +1359,89 @@ def runway_threshold_label_points(feature):
             }
         )
     return label_points
+
+
+RUNWAY_DIGIT_SEGMENTS = {
+    "0": ("a", "b", "c", "d", "e", "f"),
+    "1": ("b", "c"),
+    "2": ("a", "b", "g", "e", "d"),
+    "3": ("a", "b", "g", "c", "d"),
+    "4": ("f", "g", "b", "c"),
+    "5": ("a", "f", "g", "c", "d"),
+    "6": ("a", "f", "g", "e", "c", "d"),
+    "7": ("a", "b", "c"),
+    "8": ("a", "b", "c", "d", "e", "f", "g"),
+    "9": ("a", "b", "c", "d", "f", "g"),
+}
+
+
+def runway_digit_segment_points(segment, width_m, height_m):
+    x0 = -width_m / 2.0
+    x1 = width_m / 2.0
+    y0 = -height_m / 2.0
+    y1 = height_m / 2.0
+    ym = 0.0
+    return {
+        "a": ((x0, y1), (x1, y1)),
+        "b": ((x1, y1), (x1, ym)),
+        "c": ((x1, ym), (x1, y0)),
+        "d": ((x0, y0), (x1, y0)),
+        "e": ((x0, ym), (x0, y0)),
+        "f": ((x0, y1), (x0, ym)),
+        "g": ((x0, ym), (x1, ym)),
+    }.get(segment)
+
+
+def runway_label_line_polylines(label, center):
+    if center is None:
+        return []
+
+    digits = "".join(ch for ch in str(label or "") if ch.isdigit())
+    if len(digits) < 2:
+        return []
+    digits = digits[:2]
+
+    height_m = max(120.0, TASK_MAP_RUNWAY_LABEL_HEIGHT_M)
+    width_m = height_m * 0.42
+    gap_m = height_m * 0.18
+    total_width_m = len(digits) * width_m + (len(digits) - 1) * gap_m
+    meters_per_lat = 111320.0
+    meters_per_lon = max(1.0, meters_per_lat * math.cos(math.radians(center[1])))
+
+    def project(dx_m, dy_m):
+        return (
+            center[0] + dx_m / meters_per_lon,
+            center[1] + dy_m / meters_per_lat,
+        )
+
+    lines = []
+    start_x = -total_width_m / 2.0 + width_m / 2.0
+    for digit_index, digit in enumerate(digits):
+        digit_center_x = start_x + digit_index * (width_m + gap_m)
+        for segment in RUNWAY_DIGIT_SEGMENTS.get(digit, ()):
+            endpoints = runway_digit_segment_points(segment, width_m, height_m)
+            if endpoints is None:
+                continue
+            (x1, y1), (x2, y2) = endpoints
+            lines.append(
+                {
+                    "label": "",
+                    "points": [
+                        project(digit_center_x + x1, y1),
+                        project(digit_center_x + x2, y2),
+                    ],
+                }
+            )
+
+    return lines
+
+
+def runway_label_line_features(features):
+    lines = []
+    for feature in features or ():
+        for item in runway_threshold_label_points(feature):
+            lines.extend(runway_label_line_polylines(item.get("label"), item.get("point")))
+    return lines
 
 
 def runway_point_layers(features):
@@ -1567,6 +1659,57 @@ def blank_dbf_name_fields(dbf: bytes):
     return bytes(out), changed
 
 
+RUNWAY_PAIR_LABEL_RE = re.compile(
+    r"^\s*(?:RWY\s*)?([0-3]?\d[LCR]?)\s*[/\\-]\s*([0-3]?\d[LCR]?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_runway_pair_label(value: str) -> bool:
+    text = str(value or "").strip()
+    if not RUNWAY_PAIR_LABEL_RE.match(text):
+        return False
+    return len(ordered_runway_designator_tokens(text)) >= 2
+
+
+def blank_runway_pair_label_fields(dbf: bytes):
+    if len(dbf) < 32:
+        return dbf, 0
+
+    fields, header_len, record_len, _ = dbf_field_specs(dbf)
+    if not fields or record_len <= 0:
+        return dbf, 0
+
+    field_offsets = []
+    position = 1
+    for _, length in fields:
+        field_offsets.append((position, length))
+        position += length
+
+    out = bytearray(dbf)
+    count = struct.unpack_from("<I", dbf, 4)[0]
+    changed = 0
+    for index in range(count):
+        start = header_len + index * record_len
+        end = start + record_len
+        if end > len(out):
+            break
+        if out[start:start + 1] == b"*":
+            continue
+
+        for offset, length in field_offsets:
+            field_start = start + offset
+            field_end = field_start + length
+            raw_value = bytes(out[field_start:field_end])
+            value = raw_value.decode("latin1", errors="replace").strip()
+            if not is_runway_pair_label(value):
+                continue
+            out[field_start:field_end] = b" " * length
+            changed += 1
+
+    return bytes(out), changed
+
+
 def rewrite_topology_template_bytes(
     topology: bytes,
     forced_rows: dict[str, str],
@@ -1721,6 +1864,78 @@ def rewrite_xcm_with_thinned_labels(xcm_bytes: bytes):
                         shutil.copyfileobj(src, dst, length=1024 * 1024)
 
         return dst_path.read_bytes(), stats
+
+
+def strip_runway_pair_labels_from_xcm(xcm_bytes: bytes):
+    with tempfile.TemporaryDirectory(prefix="kigo_runway_label_strip_") as tmp:
+        src_path = Path(tmp) / "src.xcm"
+        dst_path = Path(tmp) / "dst.xcm"
+        src_path.write_bytes(xcm_bytes)
+
+        replacements = {}
+        stats = {}
+        with zipfile.ZipFile(src_path) as zin:
+            for info in zin.infolist():
+                if not info.filename.lower().endswith(".dbf"):
+                    continue
+                cleaned, changed = blank_runway_pair_label_fields(zin.read(info.filename))
+                if changed <= 0:
+                    continue
+                replacements[info.filename] = cleaned
+                stats[Path(info.filename).stem] = changed
+
+            if not replacements:
+                return xcm_bytes, {}
+
+            with zipfile.ZipFile(dst_path, "w", compression=zipfile.ZIP_STORED) as zout:
+                for info in zin.infolist():
+                    if info.filename in replacements:
+                        new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                        new_info.external_attr = info.external_attr
+                        new_info.compress_type = zipfile.ZIP_STORED
+                        zout.writestr(new_info, replacements[info.filename])
+                        continue
+                    new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                    new_info.external_attr = info.external_attr
+                    new_info.compress_type = zipfile.ZIP_STORED
+                    with zin.open(info) as src, zout.open(new_info, "w") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+        return dst_path.read_bytes(), stats
+
+
+def postprocess_task_xcm(raw: bytes, context: str):
+    try:
+        raw, label_stats = rewrite_xcm_with_thinned_labels(raw)
+        if label_stats:
+            print(
+                f"[{context}] label thinning stats={json.dumps(label_stats, sort_keys=True)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[{context}] label thinning failed (returning unthinned map): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    try:
+        raw, strip_stats = strip_runway_pair_labels_from_xcm(raw)
+        if strip_stats:
+            print(
+                f"[{context}] stripped runway pair labels={json.dumps(strip_stats, sort_keys=True)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[{context}] runway pair label strip failed (returning unstripped map): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return raw
 
 
 def validate_bbox(bbox):
@@ -2108,7 +2323,6 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
                     src, bbox, dst,
                     excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
                     forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
-                    extra_point_layers=runway_point_layers(runway_features),
                     extra_polyline_layers=runway_polyline_layers(runway_features),
                     extra_polygon_layers=runway_polygon_layers(runway_features),
                     skip_terrain_crop=True,
@@ -2120,20 +2334,7 @@ def generate_map_from_mapgen(bbox, name, runway_features=None):
                 file=sys.stderr, flush=True,
             )
 
-    try:
-        raw, label_stats = rewrite_xcm_with_thinned_labels(raw)
-        if label_stats:
-            print(
-                f"[mapgen] label thinning stats={json.dumps(label_stats, sort_keys=True)}",
-                file=sys.stderr,
-                flush=True,
-            )
-    except Exception as exc:
-        print(
-            f"[mapgen] label thinning failed (returning unthinned map): {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
+    raw = postprocess_task_xcm(raw, "mapgen")
 
     print(f"[mapgen] done name={name!r} uuid={uuid} bytes={len(raw)}", file=sys.stderr, flush=True)
     return raw, ""
@@ -2150,7 +2351,6 @@ def generate_map_from_base(base_map: BaseMap, bbox, runway_features=None):
                 dst,
                 excluded_vector_stems=TASK_MAP_EXCLUDED_VECTOR_STEMS,
                 forced_topology_rows=TASK_MAP_FORCED_TOPOLOGY_ROWS,
-                extra_point_layers=runway_point_layers(runway_features or ()),
                 extra_polyline_layers=runway_polyline_layers(runway_features or ()),
                 extra_polygon_layers=runway_polygon_layers(runway_features or ()),
             )
@@ -2162,6 +2362,8 @@ def generate_map_from_base(base_map: BaseMap, bbox, runway_features=None):
             flush=True,
         )
         return None, f"base map crop error: {exc}"
+
+    raw = postprocess_task_xcm(raw, "base-map")
 
     print(
         f"[base-map] cropped base={base_map.path.name} bbox={bbox['south']:.4f},"
