@@ -353,6 +353,26 @@ def xcm_complete(path):
         return False
 
 
+def load_previous_results(output_dir):
+    state_path = output_dir / "state.jsonl"
+    if not state_path.exists():
+        return {}
+    rows = {}
+    with state_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            name = row.get("name")
+            if name:
+                rows[name] = row
+    return rows
+
+
 def write_manifest(output_dir, plan, results):
     payload = {
         "created_epoch": time.time(),
@@ -383,6 +403,7 @@ def main(argv=None):
     parser.add_argument("--targets", default="all")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-tiles", type=int, default=0)
+    parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--timeout-s", type=int, default=900)
     parser.add_argument("--poll-s", type=float, default=10.0)
     args = parser.parse_args(argv)
@@ -414,6 +435,7 @@ def main(argv=None):
         return 0
 
     results = []
+    previous_results = load_previous_results(args.output)
     state_path = args.output / "state.jsonl"
     for index, tile in enumerate(plan, 1):
         path = args.output / f"{tile['name']}.xcm"
@@ -421,20 +443,35 @@ def main(argv=None):
         status = "unknown"
         error = ""
         uuid = ""
+        bytes_count = path.stat().st_size if path.exists() else 0
+        previous = previous_results.get(tile["name"])
         if xcm_complete(path):
             status = "skipped-existing"
+        elif (
+            previous
+            and previous.get("status") in {"incomplete", "error", "timeout"}
+            and not args.retry_failed
+        ):
+            if path.exists():
+                path.unlink()
+            status = "skipped-known-" + str(previous.get("status"))
+            error = str(previous.get("error") or "")
+            uuid = str(previous.get("uuid") or "")
+            bytes_count = int(previous.get("bytes") or 0)
         else:
             try:
                 uuid = submit_job(args.mapgen_url, tile["bbox"], tile["name"])
                 status = poll_job(args.mapgen_url, uuid, args.timeout_s, args.poll_s)
                 if status == "done":
                     data = download_job(args.mapgen_url, uuid)
+                    bytes_count = len(data)
                     tmp = path.with_suffix(".xcm.tmp")
                     tmp.write_bytes(data)
                     os.replace(tmp, path)
                     if not xcm_complete(path):
                         status = "incomplete"
                         error = "downloaded XCM missing required files"
+                        path.unlink(missing_ok=True)
                 else:
                     error = status
             except Exception as exc:
@@ -443,7 +480,7 @@ def main(argv=None):
         result = {
             **tile,
             "path": str(path),
-            "bytes": path.stat().st_size if path.exists() else 0,
+            "bytes": path.stat().st_size if path.exists() else bytes_count,
             "status": status,
             "error": error,
             "uuid": uuid,

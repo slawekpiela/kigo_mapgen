@@ -23,6 +23,14 @@ The output directory contains:
 
 The script is resumable. Existing complete XCM files are skipped. A complete
 tile must contain `terrain.jp2`, `terrain.j2w`, and `topology.tpl`.
+Known failed or incomplete tiles are skipped on resume unless `--retry-failed`
+is passed.
+
+On Anton, start the detached build with:
+
+```sh
+python3 /home/slawek/mapgen/tools/start_global_base_tiles.py
+```
 
 Default target set:
 
@@ -33,4 +41,3 @@ Default target set:
 - Japan,
 - Namibia,
 - South Africa.
-
