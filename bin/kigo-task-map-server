@@ -64,7 +64,7 @@ TASK_MAP_LABEL_TOPOLOGY_ROWS = {}
 TASK_MAP_FORCED_TOPOLOGY_ROWS = {
     "runway_area": "runway_area,20,,0,255,255,255,1,0,0,255",
     "runway_line": "runway_line,20,,0,0,0,0,3,0,0,255",
-    "runway_label_point": "runway_label_point,20,,1,0,0,0,1,20,0,255",
+    "runway_label_point": "runway_label_point,20,,1,0,0,0,1,20,20,255",
     **TASK_MAP_LABEL_TOPOLOGY_ROWS,
 }
 TASK_MAP_MARGIN_KM = 30.0
@@ -120,7 +120,7 @@ TASK_MAP_ROUTE_TILE_MARGIN_KM = float(
 TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v19-openaip-runway-threshold-labels"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v20-bold-runway-threshold-labels"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -1206,7 +1206,7 @@ def runway_centerline_feature(feature):
     if points is None:
         return None
     return {
-        "label": feature.get("label") or "",
+        "label": "",
         "points": points,
         "width_m": feature.get("width_m") or 45.0,
     }
@@ -1242,7 +1242,7 @@ def runway_area_polygon(feature):
         (lon1 - dlon, lat1 - dlat),
         (lon1 + dlon, lat1 + dlat),
     ]
-    return {"label": feature.get("label") or "", "points": polygon}
+    return {"label": "", "points": polygon}
 
 
 def runway_polygon_layers(features):
