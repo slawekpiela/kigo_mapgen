@@ -10,6 +10,7 @@ from xcsoar.mapgen.util import slurp, spew
 
 class JobDescription:
     name = None
+    mail = ""
     waypoint_file = None
     waypoint_details_file = None
     airspace_file = None
