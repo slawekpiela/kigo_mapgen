@@ -124,12 +124,12 @@ TASK_MAP_TILE_CACHE_MAX_TILES = int(
     os.environ.get("KIGO_TASK_MAP_TILE_CACHE_MAX_TILES", "3")
 )
 TASK_MAP_DBF_OUTPUT_ENCODING = os.environ.get(
-    "KIGO_TASK_MAP_DBF_OUTPUT_ENCODING", "cp1250"
+    "KIGO_TASK_MAP_DBF_OUTPUT_ENCODING", "utf-8"
 )
 TASK_MAP_DBF_OUTPUT_CPG = os.environ.get(
-    "KIGO_TASK_MAP_DBF_OUTPUT_CPG", "CP1250"
+    "KIGO_TASK_MAP_DBF_OUTPUT_CPG", "UTF-8"
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v24-cp1250-dbf-labels-compressed"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v26-utf8-dbf-mojibake-cpg"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -1743,7 +1743,7 @@ def blank_runway_pair_label_fields(dbf: bytes):
 
 
 def dbf_output_ldid():
-    raw = os.environ.get("KIGO_TASK_MAP_DBF_OUTPUT_LDID", "200").strip()
+    raw = os.environ.get("KIGO_TASK_MAP_DBF_OUTPUT_LDID", "").strip()
     if not raw:
         return None
     try:
@@ -1763,6 +1763,27 @@ def encode_dbf_text_to_field(text: str, encoding: str, length: int) -> bytes:
             return encoded.ljust(length, b" ")
         text = text[:-1]
     return b" " * length
+
+
+MOJIBAKE_MARKERS = ("Ã", "Å", "Ä", "Â", "Ë", "\u0080", "\u0081", "\u0082", "\u0083")
+
+
+def mojibake_score(text: str) -> int:
+    return sum(text.count(marker) for marker in MOJIBAKE_MARKERS)
+
+
+def repair_utf8_mojibake_text(text: str) -> str:
+    if not text or mojibake_score(text) <= 0:
+        return text
+
+    try:
+        repaired = text.encode("latin1").decode("utf-8")
+    except UnicodeError:
+        return text
+
+    if mojibake_score(repaired) < mojibake_score(text):
+        return repaired
+    return text
 
 
 def recode_dbf_text_fields(dbf: bytes, encoding: str):
@@ -1801,6 +1822,7 @@ def recode_dbf_text_fields(dbf: bytes, encoding: str):
             except UnicodeDecodeError:
                 continue
 
+            text = repair_utf8_mojibake_text(text)
             encoded = encode_dbf_text_to_field(text, encoding, field["length"])
             if encoded == raw_value:
                 continue
