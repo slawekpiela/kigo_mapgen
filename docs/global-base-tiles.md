@@ -26,6 +26,11 @@ tile must contain `terrain.jp2`, `terrain.j2w`, and `topology.tpl`.
 Known failed or incomplete tiles are skipped on resume unless `--retry-failed`
 is passed.
 
+TaskMap fallback jobs must submit mapgen with `high_quality=1` and `highres=on`.
+This keeps 3 arc-second terrain while forcing the current UTF-8 high-quality
+topology source repository; plain `highres=on` uses the older standard data path
+and can reintroduce broken DBF labels in water layers.
+
 On Anton, start the detached build with:
 
 ```sh

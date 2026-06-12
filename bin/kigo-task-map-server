@@ -5,7 +5,7 @@ Kigo posts the active task's extreme points plus its requested bbox.  The
 service first tries a ready standard 3-arcsecond XCM cache whose map still
 leaves the route at least 20 km from the edge, then crops a POL_HighRes-style
 base XCM and injects runway rectangles.  If no base XCM covers the request, it
-falls back to a standard mapgen request.
+falls back to a high-quality-data mapgen request with 3 arc-second terrain.
 """
 
 from __future__ import annotations
@@ -129,7 +129,7 @@ TASK_MAP_DBF_OUTPUT_ENCODING = os.environ.get(
 TASK_MAP_DBF_OUTPUT_CPG = os.environ.get(
     "KIGO_TASK_MAP_DBF_OUTPUT_CPG", "UTF-8"
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v26-utf8-dbf-mojibake-cpg"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v27-hq-fallback-utf8-water"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -2247,7 +2247,7 @@ def load_source_tiles() -> tuple[SourceTile, ...]:
 def source_repo_fingerprint() -> str:
     digest = hashlib.sha1()
     digest.update(TASK_MAP_XCM_CACHE_VERSION.encode("ascii"))
-    digest.update(b"pol-highres-base-crop-3arcsec-topo")
+    digest.update(b"pol-highres-base-crop-3arcsec-topo-hq-fallback")
     digest.update(f"runway-width:{TASK_MAP_RUNWAY_VISIBLE_WIDTH_M:.3f}".encode("ascii"))
     tiles = load_source_tiles()
     if not tiles:
@@ -2418,7 +2418,8 @@ def _mapgen_submit(bbox, name):
     form = {
         "name": (name or "task_map")[:80],
         "mail": "",
-        "highres": "on",           # standard mapgen topology, 3 arc-second terrain
+        "high_quality": "1",       # current UTF-8 topology source repository
+        "highres": "on",           # 3 arc-second terrain, not 1 arc-second
         "level_of_detail": "3",
         "selection": "bounds",
         "left":   f"{bbox['west']:.6f}",
