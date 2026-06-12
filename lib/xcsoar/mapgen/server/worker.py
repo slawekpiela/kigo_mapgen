@@ -14,7 +14,14 @@ DEFAULT_ESTIMATED_POWER_WATTS = 25.0
 
 
 class Worker:
-    def __init__(self, dir_jobs, dir_data):
+    def __init__(
+        self,
+        dir_jobs,
+        dir_data,
+        mail_server=None,
+        mail_sender=None,
+        **kwargs
+    ):
         check_commands()
         self.__dir_jobs = os.path.abspath(dir_jobs)
         self.__dir_data = os.path.abspath(dir_data)
