@@ -31,6 +31,11 @@ This keeps 3 arc-second terrain while forcing the current UTF-8 high-quality
 topology source repository; plain `highres=on` uses the older standard data path
 and can reintroduce broken DBF labels in water layers.
 
+TaskMap post-processing also forces POL_HighRes-style label ranges in
+`topology.tpl`: city labels at 15, town labels at 10, and all split suburb /
+village labels at 3. Keep the EPBA tile builder defaults aligned with these
+ranges so rebuilt source tiles match TaskMap output.
+
 On Anton, start the detached build with:
 
 ```sh

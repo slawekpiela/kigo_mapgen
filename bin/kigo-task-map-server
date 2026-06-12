@@ -60,7 +60,16 @@ DEFAULT_BASE_MAP_TILE_DIRS = (
 )
 
 TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset({"runway_label_point"})
-TASK_MAP_LABEL_TOPOLOGY_ROWS = {}
+TASK_MAP_LABEL_TOPOLOGY_ROWS = {
+    "city_point": "city_point,15,,1,223,223,0,1,15,10,255",
+    "town_point": "town_point,10,,1,223,223,0,1,10,3,255",
+    "suburb_major_point": "suburb_major_point,3,,1,223,223,0,1,3,0,255",
+    "suburb_medium_point": "suburb_medium_point,3,,1,223,223,0,1,3,0,255",
+    "suburb_local_point": "suburb_local_point,3,,1,223,223,0,1,3,0,255",
+    "village_major_point": "village_major_point,3,,1,223,223,0,1,3,0,255",
+    "village_medium_point": "village_medium_point,3,,1,223,223,0,1,3,0,255",
+    "village_local_point": "village_local_point,3,,1,223,223,0,1,3,0,255",
+}
 TASK_MAP_FORCED_TOPOLOGY_ROWS = {
     "runway_area": "runway_area,20,,0,255,255,255,1,0,0,255",
     "runway_line": "runway_line,20,,0,0,0,0,3,0,0,255",
@@ -129,7 +138,7 @@ TASK_MAP_DBF_OUTPUT_ENCODING = os.environ.get(
 TASK_MAP_DBF_OUTPUT_CPG = os.environ.get(
     "KIGO_TASK_MAP_DBF_OUTPUT_CPG", "UTF-8"
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v27-hq-fallback-utf8-water"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v28-pol-highres-ranges"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -2247,7 +2256,7 @@ def load_source_tiles() -> tuple[SourceTile, ...]:
 def source_repo_fingerprint() -> str:
     digest = hashlib.sha1()
     digest.update(TASK_MAP_XCM_CACHE_VERSION.encode("ascii"))
-    digest.update(b"pol-highres-base-crop-3arcsec-topo-hq-fallback")
+    digest.update(b"pol-highres-base-crop-3arcsec-topo-hq-fallback-ranges")
     digest.update(f"runway-width:{TASK_MAP_RUNWAY_VISIBLE_WIDTH_M:.3f}".encode("ascii"))
     tiles = load_source_tiles()
     if not tiles:
