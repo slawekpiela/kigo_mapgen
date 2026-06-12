@@ -5,7 +5,7 @@ Kigo posts the active task's extreme points plus its requested bbox.  The
 service first tries a ready standard 3-arcsecond XCM cache whose map still
 leaves the route at least 20 km from the edge, then crops a POL_HighRes-style
 base XCM and injects runway rectangles.  If no base XCM covers the request, it
-falls back to a high-quality-data mapgen request with 3 arc-second terrain.
+falls back to a standard mapgen request with 3 arc-second terrain.
 """
 
 from __future__ import annotations
@@ -41,13 +41,11 @@ BASE_MAP_CANDIDATES = (
     "/maps/slawek4.xcm",
     "/maps/slawek5.xcm",
     "/maps/POL_HighRes_base.xcm",
-    "/maps/POL_HighRes_1arcsec.xcm",
     "/maps/nowa_mapa2.xcm",
     "/maps/nowa_mapa.xcm",
     "/home/slawek/mapgen-output/slawek4.xcm",
     "/home/slawek/mapgen-output/slawek5.xcm",
     "/home/slawek/mapgen-output/POL_HighRes_base.xcm",
-    "/home/slawek/mapgen-output/POL_HighRes_1arcsec.xcm",
     "/home/slawek/mapgen-output/nowa_mapa2.xcm",
     "/home/slawek/mapgen-output/nowa_mapa.xcm",
 )
@@ -204,6 +202,8 @@ def xcm_terrain_bbox(xcm: Path):
         a, d, b, e, c, f = crop.read_world(world_path)
         if abs(b) > 1e-12 or abs(d) > 1e-12 or a <= 0 or e >= 0:
             raise ValueError("only north-up terrain.j2w files are supported")
+        if min(abs(a), abs(e)) * 3600.0 < 2.95:
+            raise ValueError("1 arc-second base maps are disabled")
 
         width, height = crop.image_size(terrain_path)
 
@@ -248,8 +248,12 @@ def find_base_maps(configured) -> tuple[BaseMap, ...]:
             continue
         seen.add(candidate)
         if candidate.exists():
-            terrain_bbox = xcm_terrain_bbox(candidate)
-            topology_bbox = crop.xcm_topology_bbox(candidate)
+            try:
+                terrain_bbox = xcm_terrain_bbox(candidate)
+                topology_bbox = crop.xcm_topology_bbox(candidate)
+            except Exception as exc:
+                print(f"Skipping base map {candidate}: {exc}", flush=True)
+                continue
             base_maps.append(BaseMap(candidate, terrain_bbox, topology_bbox))
 
     if base_maps:
@@ -2441,6 +2445,10 @@ def _mapgen_submit(bbox, name):
         "top":    f"{bbox['north']:.6f}",
         "bottom": f"{bbox['south']:.6f}",
     }
+    disabled = {"high_quality", "terrain_plus", "ultrahighres"}
+    if disabled.intersection(form) or form.get("level_of_detail") == "4":
+        raise RuntimeError("TaskMap must not request 1 arcsec or high-quality topology")
+
     body = urllib.parse.urlencode(form).encode("utf-8")
     req = urllib.request.Request(
         MAPGEN_URL + "/",

@@ -24,19 +24,18 @@ def main():
         dest="resolution",
         type=float,
         default=9.0,
-        help="resolution of the terrain in arcseconds per pixel; 1 requires dem1-compatible data",
+        help="resolution of the terrain in arcseconds per pixel; minimum allowed is 3",
     )
     parser.add_argument(
         "-l",
         metavar="level_of_detail",
         dest="level_of_detail",
-        choices=[1, 2, 3, 4],
+        choices=[1, 2, 3],
         type=int,
         default=3,
         help="""1: only major topography,
                                 2: medium level of detail,
-                                3: every tiny city name and road,
-                                4: ultra detail from a custom data source""",
+                                3: every tiny city name and road""",
     )
     parser.add_argument(
         "-c",
@@ -98,6 +97,10 @@ def main():
     parser.add_argument("output_file", help="filename of the output file")
 
     args = parser.parse_args()
+    if args.resolution < 3.0:
+        parser.error("1 arc-second terrain generation is disabled")
+    if args.level_of_detail > 3:
+        parser.error("topology level 4 / high-quality topology is disabled")
 
     dir_temp = "/tmp/mapgen-{}".format(os.getpid())
     try:

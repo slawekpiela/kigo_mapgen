@@ -114,6 +114,15 @@ class Worker:
 
     @contextmanager
     def __data_environment(self, description):
+        if getattr(description, "high_quality", False):
+            raise RuntimeError("High quality topology is disabled.")
+        if getattr(description, "terrain_plus", False):
+            raise RuntimeError("1 arc-second terrain is disabled.")
+        if getattr(description, "level_of_detail", 3) > 3:
+            raise RuntimeError("Topology level 4 is disabled.")
+        if float(getattr(description, "resolution", 9.0)) < 3.0:
+            raise RuntimeError("1 arc-second terrain is disabled.")
+
         if not getattr(description, "high_quality", False):
             yield self.__dir_data
             return

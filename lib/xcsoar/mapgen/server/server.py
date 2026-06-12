@@ -15,6 +15,13 @@ from xcsoar.mapgen.georect import GeoRect
 from xcsoar.mapgen.waypoints.parser import parse_waypoint_file
 
 
+DISABLED_OPTIONS = {
+    "high_quality": "Generate high quality Kigo map",
+    "terrain_plus": "Terrain plus / 1 arcsecond terrain",
+    "ultrahighres": "Ultra resolution terrain / 1 arcsecond terrain",
+}
+
+
 def _download_filename(name):
     stem = (name or "").strip()
     if not stem:
@@ -110,6 +117,14 @@ class Server(object):
         if cherrypy.request.method != "POST":
             return view.render()
 
+        disabled = [label for key, label in DISABLED_OPTIONS.items() if key in params]
+        if disabled:
+            raise cherrypy.HTTPError(
+                400,
+                "Disabled map option(s): {}. Use standard topology and 3 arc-second terrain."
+                .format(", ".join(disabled)),
+            )
+
         name = params["name"].strip()
         if name == "":
             return view.render(error="No map name given!") | HTMLFormFiller(data=params)
@@ -137,6 +152,11 @@ class Server(object):
                 params["level_of_detail"]
             )
             desc.compressed = "compressed" in params
+            if desc.level_of_detail > 3:
+                raise cherrypy.HTTPError(
+                    400,
+                    "Topology level 4 is disabled. Use standard topology levels 1-3.",
+                )
         desc.welt2000 = "welt2000" in params
 
         selection = params["selection"]

@@ -28,9 +28,9 @@ is passed.
 
 TaskMap fallback jobs must submit mapgen with plain `highres=on`. This keeps the
 standard mapgen topology and 3 arc-second terrain, then TaskMap injects runway
-areas, center lines, and threshold labels as a post-process. Do not enable
-`high_quality` for TaskMap fallback unless the visual topology is intentionally
-being changed.
+areas, center lines, and threshold labels as a post-process. The web frontend,
+worker, and CLI reject 1 arc-second terrain, `high_quality`, and topology level
+4 so TaskMap cannot accidentally switch to high-quality topology.
 
 TaskMap post-processing also forces POL_HighRes-style label ranges in
 `topology.tpl`: city labels at 15, town labels at 10, and all split suburb /

@@ -19,17 +19,10 @@
         <input id="name" type="text" name="name" pattern="^[a-zA-Z0-9_\s]*$" title="Only Ascii (a-z) and numeric characters, spaces and dashes."/>
   <label>Options:</label>
   <div class="box">
-    <input type="checkbox" name="high_quality" id="high_quality" value="1"/>
-    <label for="high_quality">Generate high quality Kigo map (1 arcsecond terrain, ultra OSM detail, data attribution included)</label><br/>
-    <input type="checkbox" name="terrain_plus" id="terrain_plus" value="1"/>
-    <label for="terrain_plus">Terrain plus (standard topography, 1 arcsecond terrain)</label><br/>
-    <hr/>
     <input type="checkbox" name="welt2000" id="welt2000"/>
     <label for="highres">Include the <a href="https://github.com/XCSoar/xcsoar-data-content/tree/master/waypoints">XCSoar Waypoint Database</a></label><br/>
     <input type="checkbox" name="highres" id="highres" value="1"/>
     <label for="highres">High resolution terrain (3 arcseconds per pixel instead of 9)</label><br/>
-    <input type="checkbox" name="ultrahighres" id="ultrahighres" value="1"/>
-    <label for="ultrahighres">Ultra resolution terrain (1 arcsecond per pixel, requires dem1 data)</label><br/>
     <input type="checkbox" name="compressed" id="compressed"/>
     <label for="compressed">Compressed topography (smaller filesize, but slower)</label><br/>
     <input type="checkbox" name="omit_path_lines" id="omit_path_lines"/>
@@ -38,8 +31,6 @@
     <label for="omit_track_lines">Omit track lines from topography (keeps roads)</label><br/>
     <hr/>
     <span style="font-size: 10pt;">Level of detail:</span><br/>
-    <input type="radio" name="level_of_detail" value="4" id="radio_lod4"/>
-    <label for="radio_lod4">4: Ultra detail from a custom OSM data source.</label><br/>
     <input type="radio" name="level_of_detail" value="3" id="radio_lod3" checked="checked"/>
     <label for="radio_lod3">3: Every little village and road that we know of.</label><br/>
     <input type="radio" name="level_of_detail" value="2" id="radio_lod2"/>
