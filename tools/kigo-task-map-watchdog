@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -u
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+SERVICE_NAME="${KIGO_TASK_MAP_WATCHDOG_SERVICE:-kigo-task-map-service}"
+HEALTH_URL="${KIGO_TASK_MAP_WATCHDOG_URL:-http://127.0.0.1:8787/health}"
+MAIL_TO="${KIGO_TASK_MAP_WATCHDOG_MAIL_TO:-kigo@kigoconcept.pl}"
+LOG_FILE="${KIGO_TASK_MAP_WATCHDOG_LOG:-/home/slawek/kigo-task-map-service/watchdog.log}"
+LOCK_DIR="${KIGO_TASK_MAP_WATCHDOG_LOCK:-/tmp/kigo-task-map-watchdog.lock}"
+CURL="/usr/bin/curl"
+DOCKER="/usr/bin/docker"
+SENDMAIL="/usr/sbin/sendmail"
+
+timestamp() {
+    date -Is
+}
+
+log_line() {
+    printf '%s %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"
+}
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    log_line "skipped: lock held"
+    exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+health_output="$("$CURL" -fsS --max-time 10 "$HEALTH_URL" 2>&1)"
+health_status=$?
+health_text="$(printf '%s' "$health_output" | tr -d '\r\n')"
+
+if [ "$health_status" -eq 0 ] && [ "$health_text" = "ok" ]; then
+    exit 0
+fi
+
+failure_reason="curl_exit=${health_status}; health_output=${health_output}"
+restart_output="$("$DOCKER" restart "$SERVICE_NAME" 2>&1)"
+restart_status=$?
+
+sleep 5
+
+post_health_output="$("$CURL" -fsS --max-time 10 "$HEALTH_URL" 2>&1)"
+post_health_status=$?
+post_health_text="$(printf '%s' "$post_health_output" | tr -d '\r\n')"
+container_status="$("$DOCKER" ps --filter "name=^/${SERVICE_NAME}$" --format '{{.Names}} {{.Status}} {{.Ports}}' 2>&1)"
+host_name="$(hostname -f 2>/dev/null || hostname)"
+
+log_line "restart triggered: ${failure_reason}; restart_exit=${restart_status}; restart_output=${restart_output}; post_health_exit=${post_health_status}; post_health=${post_health_output}; container=${container_status}"
+
+"$SENDMAIL" -t <<MAIL
+To: ${MAIL_TO}
+Subject: [anton] Kigo task map watchdog restarted ${SERVICE_NAME}
+Content-Type: text/plain; charset=UTF-8
+
+Kigo task map watchdog on ${host_name} restarted ${SERVICE_NAME}.
+
+Time: $(timestamp)
+Health URL: ${HEALTH_URL}
+Failure: ${failure_reason}
+
+Restart exit: ${restart_status}
+Restart output:
+${restart_output}
+
+Post-restart health exit: ${post_health_status}
+Post-restart health output:
+${post_health_output}
+
+Container status:
+${container_status}
+MAIL
+
+mail_status=$?
+log_line "mail sent: recipient=${MAIL_TO}; sendmail_exit=${mail_status}; post_health_text=${post_health_text}"
+
+exit 0
