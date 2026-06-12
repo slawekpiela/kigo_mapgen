@@ -59,6 +59,12 @@ DEFAULT_BASE_MAP_TILE_DIRS = (
     "/home/slawek/mapgen-output/taskmap-base-tiles",
 )
 
+TASK_MAP_USE_BASE_CROP = os.environ.get("KIGO_TASK_MAP_USE_BASE_CROP", "0") in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 TASK_MAP_EXCLUDED_VECTOR_STEMS = frozenset({"runway_label_point"})
 TASK_MAP_LABEL_TOPOLOGY_ROWS = {
     "city_point": "city_point,15,,1,223,223,0,1,15,10,255",
@@ -138,7 +144,7 @@ TASK_MAP_DBF_OUTPUT_ENCODING = os.environ.get(
 TASK_MAP_DBF_OUTPUT_CPG = os.environ.get(
     "KIGO_TASK_MAP_DBF_OUTPUT_CPG", "UTF-8"
 )
-TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v28-pol-highres-ranges"
+TASK_MAP_XCM_CACHE_VERSION = "kigo-task-map-xcm-cache-v29-standard-mapgen-ranges"
 TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO = float(
     os.environ.get("KIGO_TASK_MAP_COVERING_CACHE_MAX_AREA_RATIO", "1.5")
 )
@@ -2256,7 +2262,7 @@ def load_source_tiles() -> tuple[SourceTile, ...]:
 def source_repo_fingerprint() -> str:
     digest = hashlib.sha1()
     digest.update(TASK_MAP_XCM_CACHE_VERSION.encode("ascii"))
-    digest.update(b"pol-highres-base-crop-3arcsec-topo-hq-fallback-ranges")
+    digest.update(b"standard-mapgen-3arcsec-topo-runways-ranges")
     digest.update(f"runway-width:{TASK_MAP_RUNWAY_VISIBLE_WIDTH_M:.3f}".encode("ascii"))
     tiles = load_source_tiles()
     if not tiles:
@@ -2427,8 +2433,7 @@ def _mapgen_submit(bbox, name):
     form = {
         "name": (name or "task_map")[:80],
         "mail": "",
-        "high_quality": "1",       # current UTF-8 topology source repository
-        "highres": "on",           # 3 arc-second terrain, not 1 arc-second
+        "highres": "on",           # standard mapgen topology, 3 arc-second terrain
         "level_of_detail": "3",
         "selection": "bounds",
         "left":   f"{bbox['west']:.6f}",
@@ -2719,16 +2724,18 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             )
             return
 
-        try:
-            base_map = select_base_map(self.base_maps, bbox)
-        except Exception as exc:
-            self.log_message(
-                "base-map crop unavailable task=%r bbox=%s error=%r; falling back to mapgen",
-                task_name,
-                bbox_header_text(bbox),
-                str(exc),
-            )
-        else:
+        base_map = None
+        if TASK_MAP_USE_BASE_CROP:
+            try:
+                base_map = select_base_map(self.base_maps, bbox)
+            except Exception as exc:
+                self.log_message(
+                    "base-map crop unavailable task=%r bbox=%s error=%r; falling back to mapgen",
+                    task_name,
+                    bbox_header_text(bbox),
+                    str(exc),
+                )
+        if base_map is not None:
             base_tile_name = base_map.path.name
             cache_key = xcm_cache_digest(
                 "base-crop",
@@ -2954,11 +2961,14 @@ def main():
     parser.add_argument("--base-xcm", type=Path)
     args = parser.parse_args()
 
-    TaskMapHandler.base_maps = find_base_maps(args.base_xcm)
+    TaskMapHandler.base_maps = find_base_maps(args.base_xcm) if TASK_MAP_USE_BASE_CROP else ()
     server = ThreadingHTTPServer((args.host, args.port), TaskMapHandler)
     print(
         f"Kigo task map service listening on {args.host}:{args.port}; "
-        "bases=" + ", ".join(str(base.path) for base in TaskMapHandler.base_maps),
+        "base_crop="
+        + ("on" if TASK_MAP_USE_BASE_CROP else "off")
+        + "; bases="
+        + ", ".join(str(base.path) for base in TaskMapHandler.base_maps),
         flush=True,
     )
     server.serve_forever()

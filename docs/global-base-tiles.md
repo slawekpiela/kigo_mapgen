@@ -26,15 +26,17 @@ tile must contain `terrain.jp2`, `terrain.j2w`, and `topology.tpl`.
 Known failed or incomplete tiles are skipped on resume unless `--retry-failed`
 is passed.
 
-TaskMap fallback jobs must submit mapgen with `high_quality=1` and `highres=on`.
-This keeps 3 arc-second terrain while forcing the current UTF-8 high-quality
-topology source repository; plain `highres=on` uses the older standard data path
-and can reintroduce broken DBF labels in water layers.
+TaskMap fallback jobs must submit mapgen with plain `highres=on`. This keeps the
+standard mapgen topology and 3 arc-second terrain, then TaskMap injects runway
+areas, center lines, and threshold labels as a post-process. Do not enable
+`high_quality` for TaskMap fallback unless the visual topology is intentionally
+being changed.
 
 TaskMap post-processing also forces POL_HighRes-style label ranges in
 `topology.tpl`: city labels at 15, town labels at 10, and all split suburb /
-village labels at 3. Keep the EPBA tile builder defaults aligned with these
-ranges so rebuilt source tiles match TaskMap output.
+village labels at 3. Base XCM crop is disabled by default because prebuilt
+high-quality tiles can change the visual topology; enable it only with
+`KIGO_TASK_MAP_USE_BASE_CROP=1`.
 
 On Anton, start the detached build with:
 
