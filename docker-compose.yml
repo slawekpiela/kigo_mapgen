@@ -40,6 +40,7 @@ services:
       - ${KIGO_TASK_MAP_BASE_MAP_DIR:-/maps}:/maps:ro
       - kigo-task-map-runways:/tmp/kigo_task_map_runways
       - kigo-task-map-xcm-cache:/tmp/kigo_task_map_xcm_cache
+      - kigo-airspace-cache:/tmp/kigo_airspace_cache
       - ${MAPGEN_HIGH_QUALITY_DATA_DIR:-/home/slawek/mapgen-data-nowa_mapa2/repo}:/opt/mapgen/high-quality-data:ro
     environment:
       - KIGO_MAPGEN_URL=${KIGO_MAPGEN_URL:-http://172.17.0.1:9091}
@@ -49,9 +50,12 @@ services:
       - KIGO_TASK_MAP_SOURCE_REPO=/opt/mapgen/high-quality-data
       - KIGO_TASK_MAP_ROUTE_TILE_MARGIN_KM=${KIGO_TASK_MAP_ROUTE_TILE_MARGIN_KM:-20}
       - KIGO_TASK_MAP_TILE_CACHE_MAX_TILES=${KIGO_TASK_MAP_TILE_CACHE_MAX_TILES:-3}
+      - KIGO_AIRSPACE_PACKAGE_DIRS=${KIGO_AIRSPACE_PACKAGE_DIRS:-/maps/airspaces}
+      - KIGO_AIRSPACE_CACHE_DIR=/tmp/kigo_airspace_cache
 
 volumes:
   mapgen-data:
   mapgen-jobs:
   kigo-task-map-runways:
   kigo-task-map-xcm-cache:
+  kigo-airspace-cache:

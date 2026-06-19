@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""HTTP task-map service for Kigo remote map generation.
+"""HTTP service for Kigo remote map and airspace generation.
 
 Kigo posts the active task's extreme points plus its requested bbox.  The
 service first tries a ready standard 3-arcsecond XCM cache whose map still
 leaves the route at least 20 km from the edge, then crops a POL_HighRes-style
 base XCM and injects runway rectangles.  If no base XCM covers the request, it
 falls back to a standard mapgen request with 3 arc-second terrain.
+
+Kigo also posts airspace country selections to /api/airspace; that endpoint is
+implemented in kigo_airspace.py and returns one ready OpenAir text file.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import crop_xcm_corridor as crop
+import kigo_airspace
 
 
 BASE_MAP_CANDIDATES = (
@@ -2666,6 +2670,10 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             self.send_text(404, "not found")
 
     def do_POST(self):
+        if self.path == "/api/airspace":
+            kigo_airspace.handle_airspace_post(self)
+            return
+
         if self.path != "/api/task-map":
             self.send_text(404, "not found")
             return

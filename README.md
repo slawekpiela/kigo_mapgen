@@ -55,6 +55,21 @@ These are named volumes inside your docker service.
 Port 9090
 ```
 
+### Kigo TaskMap And Airspace Service
+
+The `kigo-task-map` container exposes Kigo-specific HTTP endpoints:
+
+```text
+POST /api/task-map
+POST /api/airspace
+GET /health
+```
+
+`/api/airspace` returns one ready OpenAir text file assembled from prepared
+country packages on the server.  Put packages under `/maps/airspaces` or set
+`KIGO_AIRSPACE_PACKAGE_DIRS`.  Details are in
+`docs/kigo-airspace-service.md`.
+
 ### Build Variables
 
 The Following build variables can be set during build (optional):
