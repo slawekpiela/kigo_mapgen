@@ -26,11 +26,17 @@ tile must contain `terrain.jp2`, `terrain.j2w`, and `topology.tpl`.
 Known failed or incomplete tiles are skipped on resume unless `--retry-failed`
 is passed.
 
-TaskMap fallback jobs must submit mapgen with plain `highres=on`. This keeps the
-standard mapgen topology and 3 arc-second terrain, then TaskMap injects runway
-areas, center lines, and threshold labels as a post-process. The web frontend,
-worker, and CLI reject 1 arc-second terrain, `high_quality`, and topology level
-4 so TaskMap cannot accidentally switch to high-quality topology.
+TaskMap standard fallback jobs submit mapgen with plain `highres=on`. Ultra
+fallback jobs also pass the internal `terrain_1arc=on` flag. Both paths keep the
+standard mapgen topology and then TaskMap injects runway areas, center lines,
+and threshold labels as a post-process. The public web frontend and CLI still
+reject `high_quality`, `terrain_plus`, `ultrahighres`, and topology level 4 so
+TaskMap cannot accidentally switch to high-quality topology.
+
+1 arc-second base tiles belong in a separate tile directory, for example
+`/home/slawek/mapgen-output/taskmap-base-tiles-1arc-standard-topology`. TaskMap
+keeps 1arc and 3arc cache keys separate through the `terrain_arcsec` request
+field and XCM cache metadata.
 
 TaskMap post-processing also forces POL_HighRes-style label ranges in
 `topology.tpl`: city labels at 15, town labels at 10, and all split suburb /

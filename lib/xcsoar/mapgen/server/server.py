@@ -21,6 +21,8 @@ DISABLED_OPTIONS = {
     "ultrahighres": "Ultra resolution terrain / 1 arcsecond terrain",
 }
 
+TASK_MAP_TERRAIN_1ARC_PARAM = "terrain_1arc"
+
 
 def _download_filename(name):
     stem = (name or "").strip()
@@ -134,6 +136,7 @@ class Server(object):
         desc.mail = params.get("mail", "")
         desc.high_quality = "high_quality" in params
         desc.terrain_plus = "terrain_plus" in params
+        desc.terrain_1arc = TASK_MAP_TERRAIN_1ARC_PARAM in params
         desc.omit_path_lines = "omit_path_lines" in params
         desc.omit_track_lines = "omit_track_lines" in params
         desc.omit_path_track_lines = "omit_path_track_lines" in params
@@ -142,7 +145,9 @@ class Server(object):
             desc.level_of_detail = 4
             desc.compressed = False
         else:
-            if desc.terrain_plus or "ultrahighres" in params:
+            if desc.terrain_1arc:
+                desc.resolution = 1.0
+            elif desc.terrain_plus or "ultrahighres" in params:
                 desc.resolution = 1.0
             elif "highres" in params:
                 desc.resolution = 3.0

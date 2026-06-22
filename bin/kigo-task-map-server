@@ -54,11 +54,15 @@ BASE_MAP_CANDIDATES = (
     "/home/slawek/mapgen-output/nowa_mapa.xcm",
 )
 
-DEFAULT_BASE_MAP_TILE_DIRS = (
+DEFAULT_BASE_MAP_TILE_DIRS_3ARC = (
     "/maps/taskmap-base-tiles-3arcsec-runways",
     "/maps/taskmap-base-tiles",
     "/home/slawek/mapgen-output/taskmap-base-tiles-3arcsec-runways",
     "/home/slawek/mapgen-output/taskmap-base-tiles",
+)
+DEFAULT_BASE_MAP_TILE_DIRS_1ARC = (
+    "/maps/taskmap-base-tiles-1arc-standard-topology",
+    "/home/slawek/mapgen-output/taskmap-base-tiles-1arc-standard-topology",
 )
 
 TASK_MAP_USE_BASE_CROP = os.environ.get("KIGO_TASK_MAP_USE_BASE_CROP", "0") in (
@@ -186,6 +190,7 @@ class BaseMap:
     path: Path
     bbox: dict[str, float]           # terrain coverage
     topology_bbox: "dict | None"     # topology coverage, None = no shapefile data
+    terrain_arcsec: int
 
 
 @dataclass(frozen=True)
@@ -194,7 +199,7 @@ class SourceTile:
     bbox: dict[str, float]
 
 
-def xcm_terrain_bbox(xcm: Path):
+def xcm_terrain_info(xcm: Path):
     with zipfile.ZipFile(xcm) as zf, tempfile.TemporaryDirectory(
         prefix="kigo_task_map_base_"
     ) as tmp:
@@ -206,8 +211,7 @@ def xcm_terrain_bbox(xcm: Path):
         a, d, b, e, c, f = crop.read_world(world_path)
         if abs(b) > 1e-12 or abs(d) > 1e-12 or a <= 0 or e >= 0:
             raise ValueError("only north-up terrain.j2w files are supported")
-        if min(abs(a), abs(e)) * 3600.0 < 2.95:
-            raise ValueError("1 arc-second base maps are disabled")
+        terrain_arcsec = 1 if min(abs(a), abs(e)) * 3600.0 < 2.0 else 3
 
         width, height = crop.image_size(terrain_path)
 
@@ -215,7 +219,7 @@ def xcm_terrain_bbox(xcm: Path):
     east = west + a * width
     north = f - e / 2.0
     south = north + e * height
-    return {"south": south, "west": west, "north": north, "east": east}
+    return {"south": south, "west": west, "north": north, "east": east}, terrain_arcsec
 
 
 def base_map_tile_dirs() -> tuple[Path, ...]:
@@ -223,7 +227,17 @@ def base_map_tile_dirs() -> tuple[Path, ...]:
     if configured:
         parts = configured.replace(";", ",").split(",")
         return tuple(Path(part.strip()) for part in parts if part.strip())
-    return tuple(Path(path) for path in DEFAULT_BASE_MAP_TILE_DIRS)
+    configured_1arc = os.environ.get("KIGO_TASK_MAP_BASE_TILE_DIRS_1ARC")
+    if configured_1arc:
+        one_arc = tuple(
+            Path(part.strip())
+            for part in configured_1arc.replace(";", ",").split(",")
+            if part.strip()
+        )
+    else:
+        one_arc = tuple(Path(path) for path in DEFAULT_BASE_MAP_TILE_DIRS_1ARC)
+
+    return tuple(Path(path) for path in DEFAULT_BASE_MAP_TILE_DIRS_3ARC) + one_arc
 
 
 def iter_base_map_candidates(configured):
@@ -253,12 +267,12 @@ def find_base_maps(configured) -> tuple[BaseMap, ...]:
         seen.add(candidate)
         if candidate.exists():
             try:
-                terrain_bbox = xcm_terrain_bbox(candidate)
+                terrain_bbox, terrain_arcsec = xcm_terrain_info(candidate)
                 topology_bbox = crop.xcm_topology_bbox(candidate)
             except Exception as exc:
                 print(f"Skipping base map {candidate}: {exc}", flush=True)
                 continue
-            base_maps.append(BaseMap(candidate, terrain_bbox, topology_bbox))
+            base_maps.append(BaseMap(candidate, terrain_bbox, topology_bbox, terrain_arcsec))
 
     if base_maps:
         return tuple(base_maps)
@@ -280,6 +294,16 @@ def task_map_margin_km(payload) -> float:
         raise ValueError("margin_km must be positive")
 
     return max(TASK_MAP_MARGIN_KM, margin)
+
+
+def task_map_terrain_arcsec(payload) -> int:
+    raw = payload.get("terrain_arcsec", 3)
+    arcsec = number(raw, "terrain_arcsec")
+    if abs(arcsec - 1.0) < 0.01:
+        return 1
+    if abs(arcsec - 3.0) < 0.01:
+        return 3
+    raise ValueError("terrain_arcsec must be 1 or 3")
 
 
 def bbox_from_dict(bbox_dict):
@@ -2220,9 +2244,11 @@ def bbox_header_text(bbox) -> str:
     )
 
 
-def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
+def select_base_map(base_maps: tuple[BaseMap, ...], bbox, terrain_arcsec: int) -> BaseMap:
     matching = []
     for base_map in base_maps:
+        if base_map.terrain_arcsec != terrain_arcsec:
+            continue
         if not bbox_contains(base_map.bbox, bbox):
             continue
         if base_map.topology_bbox is None or not bbox_contains(base_map.topology_bbox, bbox):
@@ -2242,7 +2268,9 @@ def select_base_map(base_maps: tuple[BaseMap, ...], bbox) -> BaseMap:
         f"{bbox['south']:.6f},{bbox['west']:.6f},"
         f"{bbox['north']:.6f},{bbox['east']:.6f}"
     )
-    raise ValueError(f"no base map covers requested bbox {formatted}")
+    raise ValueError(
+        f"no {terrain_arcsec}arc base map covers requested bbox {formatted}"
+    )
 
 
 def load_source_tiles() -> tuple[SourceTile, ...]:
@@ -2270,7 +2298,7 @@ def load_source_tiles() -> tuple[SourceTile, ...]:
 def source_repo_fingerprint() -> str:
     digest = hashlib.sha1()
     digest.update(TASK_MAP_XCM_CACHE_VERSION.encode("ascii"))
-    digest.update(b"standard-mapgen-3arcsec-topo-runways-ranges")
+    digest.update(b"standard-mapgen-topo-runways-ranges")
     digest.update(f"runway-width:{TASK_MAP_RUNWAY_VISIBLE_WIDTH_M:.3f}".encode("ascii"))
     tiles = load_source_tiles()
     if not tiles:
@@ -2301,11 +2329,13 @@ def select_source_tile_cache(required_bbox):
     return tuple(sorted(selected, key=lambda tile: tile.name)), union
 
 
-def xcm_cache_digest(kind: str, source_key: str, bbox, tile_names=()) -> str:
+def xcm_cache_digest(kind: str, source_key: str, bbox, tile_names=(),
+                     terrain_arcsec: int = 3) -> str:
     payload = {
         "version": TASK_MAP_XCM_CACHE_VERSION,
         "kind": kind,
         "source_key": source_key,
+        "terrain_arcsec": int(terrain_arcsec),
         "bbox": {key: round(float(value), 8) for key, value in sorted(bbox.items())},
         "tiles": list(tile_names),
         "runway_width_m": TASK_MAP_RUNWAY_VISIBLE_WIDTH_M,
@@ -2334,7 +2364,7 @@ def read_cached_xcm(cache_key: str):
         return None
 
 
-def find_covering_cached_xcm(required_bbox, source_key: str):
+def find_covering_cached_xcm(required_bbox, source_key: str, terrain_arcsec: int):
     if not TASK_MAP_XCM_CACHE_DIR.exists():
         return None
 
@@ -2351,6 +2381,8 @@ def find_covering_cached_xcm(required_bbox, source_key: str):
             if metadata.get("version") != TASK_MAP_XCM_CACHE_VERSION:
                 continue
             if metadata.get("source_key") != source_key:
+                continue
+            if int(metadata.get("terrain_arcsec") or 3) != terrain_arcsec:
                 continue
             cached_bbox = metadata.get("bbox")
             if not isinstance(cached_bbox, dict) or not bbox_contains(cached_bbox, required_bbox):
@@ -2401,11 +2433,13 @@ def prepare_cached_xcm(data: bytes, metadata: dict, cache_key: str, context: str
 
 def build_cache_metadata(kind: str, source_key: str, bbox, request_bbox,
                          required_bbox, tile_names, bytes_count: int,
-                         runway_count: int, runway_source: str):
+                         runway_count: int, runway_source: str,
+                         terrain_arcsec: int):
     return {
         "version": TASK_MAP_XCM_CACHE_VERSION,
         "kind": kind,
         "source_key": source_key,
+        "terrain_arcsec": int(terrain_arcsec),
         "bbox": bbox,
         "request_bbox": request_bbox,
         "required_bbox": required_bbox,
@@ -2436,12 +2470,12 @@ class _StopRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _mapgen_submit(bbox, name):
+def _mapgen_submit(bbox, name, terrain_arcsec: int = 3):
     """POST to mapgen and return job UUID.  Raises on failure."""
     form = {
         "name": (name or "task_map")[:80],
         "mail": "",
-        "highres": "on",           # standard mapgen topology, 3 arc-second terrain
+        "highres": "on",           # standard mapgen topology
         "level_of_detail": "3",
         "selection": "bounds",
         "left":   f"{bbox['west']:.6f}",
@@ -2449,9 +2483,12 @@ def _mapgen_submit(bbox, name):
         "top":    f"{bbox['north']:.6f}",
         "bottom": f"{bbox['south']:.6f}",
     }
+    if terrain_arcsec == 1:
+        form["terrain_1arc"] = "on"
+
     disabled = {"high_quality", "terrain_plus", "ultrahighres"}
     if disabled.intersection(form) or form.get("level_of_detail") == "4":
-        raise RuntimeError("TaskMap must not request 1 arcsec or high-quality topology")
+        raise RuntimeError("TaskMap must not request high-quality topology")
 
     body = urllib.parse.urlencode(form).encode("utf-8")
     req = urllib.request.Request(
@@ -2513,16 +2550,17 @@ def _xcm_has_required_map_files(xcm_bytes):
     return {"terrain.jp2", "terrain.j2w", "topology.tpl"}.issubset(names)
 
 
-def generate_map_from_mapgen(bbox, name, runway_features=None):
+def generate_map_from_mapgen(bbox, name, runway_features=None, terrain_arcsec: int = 3):
     """Generate a new XCM map via mapgen, inject runways, return bytes or None."""
     try:
-        uuid = _mapgen_submit(bbox, name)
+        uuid = _mapgen_submit(bbox, name, terrain_arcsec)
     except Exception as exc:
         print(f"[mapgen] submit failed: {exc}", file=sys.stderr, flush=True)
         return None, f"mapgen submit error: {exc}"
 
     print(
-        f"[mapgen] submitted name={name!r} uuid={uuid} bbox={bbox['south']:.4f},"
+        f"[mapgen] submitted name={name!r} terrain={terrain_arcsec}arc "
+        f"uuid={uuid} bbox={bbox['south']:.4f},"
         f"{bbox['west']:.4f},{bbox['north']:.4f},{bbox['east']:.4f}",
         file=sys.stderr, flush=True,
     )
@@ -2627,12 +2665,13 @@ class TaskMapHandler(BaseHTTPRequestHandler):
     def send_xcm(self, data: bytes, *, bbox, task_name: str, map_name: str,
                  task_points, runway_features, runway_source: str,
                  runway_error: str, map_source: str, cache_status: str,
-                 cache_key: str = "", tile_names=()):
+                 terrain_arcsec: int, cache_key: str = "", tile_names=()):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Disposition", "attachment; filename=task_map_30km.xcm")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Kigo-Bbox", bbox_header_text(bbox))
+        self.send_header("X-Kigo-Terrain-Arcsec", str(int(terrain_arcsec)))
         self.send_header("X-Kigo-Base-Map", map_source)
         self.send_header("X-Kigo-Map-Source", map_source)
         self.send_header("X-Kigo-Map-Name", map_name)
@@ -2649,9 +2688,10 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
         self.log_message(
-            "task-map generated task=%r map_name=%r source=%s cache=%s points=%d runways=%d runway_source=%s runway_error=%r bbox=%s bytes=%d tiles=%s",
+            "task-map generated task=%r map_name=%r terrain=%darc source=%s cache=%s points=%d runways=%d runway_source=%s runway_error=%r bbox=%s bytes=%d tiles=%s",
             task_name,
             map_name,
+            terrain_arcsec,
             map_source,
             cache_status,
             len(task_points),
@@ -2697,24 +2737,26 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             task_points = task_points_from_payload(payload)
             required_bbox = route_cache_bbox(payload, bbox, task_points)
             validate_bbox(required_bbox)
+            terrain_arcsec = task_map_terrain_arcsec(payload)
         except Exception as exc:
             self.send_text(400, f"bad task map request: {exc}")
             return
 
         bbox_header = bbox_header_text(bbox)
         task_name = str(payload.get("task_name") or "task_map")
-        map_name = f"{task_name}_gen"
+        map_name = f"{task_name}_{terrain_arcsec}arc_gen"
         self.log_message(
-            "task-map request task=%r map_name=%r bbox=%s required_bbox=%s points=%s",
+            "task-map request task=%r map_name=%r terrain=%darc bbox=%s required_bbox=%s points=%s",
             task_name,
             map_name,
+            terrain_arcsec,
             bbox_header,
             bbox_header_text(required_bbox),
             payload_points_summary(payload),
         )
 
         source_key = source_repo_fingerprint()
-        cached = find_covering_cached_xcm(required_bbox, source_key)
+        cached = find_covering_cached_xcm(required_bbox, source_key, terrain_arcsec)
         if cached is not None:
             data, metadata, _ = cached
             data = prepare_cached_xcm(
@@ -2735,6 +2777,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                 runway_error="",
                 map_source="xcm-cache",
                 cache_status="hit",
+                terrain_arcsec=terrain_arcsec,
                 cache_key=str(metadata.get("cache_key") or ""),
                 tile_names=metadata.get("tiles") or (),
             )
@@ -2743,7 +2786,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         base_map = None
         if TASK_MAP_USE_BASE_CROP:
             try:
-                base_map = select_base_map(self.base_maps, bbox)
+                base_map = select_base_map(self.base_maps, bbox, terrain_arcsec)
             except Exception as exc:
                 self.log_message(
                     "base-map crop unavailable task=%r bbox=%s error=%r; falling back to mapgen",
@@ -2758,6 +2801,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                 source_key,
                 bbox,
                 (base_tile_name,),
+                terrain_arcsec=terrain_arcsec,
             )
             cached = read_cached_xcm(cache_key)
             if cached is not None:
@@ -2774,6 +2818,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                     runway_error="",
                     map_source="xcm-cache",
                     cache_status="base-hit",
+                    terrain_arcsec=terrain_arcsec,
                     cache_key=cache_key,
                     tile_names=(base_tile_name,),
                 )
@@ -2802,6 +2847,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                     len(data),
                     len(runway_features),
                     runway_source,
+                    terrain_arcsec,
                 )
                 metadata["cache_key"] = cache_key
                 save_cached_xcm(cache_key, data, metadata)
@@ -2816,6 +2862,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                     runway_error=runway_error,
                     map_source=f"base-crop:{base_tile_name}",
                     cache_status="base-miss-filled",
+                    terrain_arcsec=terrain_arcsec,
                     cache_key=cache_key,
                     tile_names=(base_tile_name,),
                 )
@@ -2832,7 +2879,13 @@ class TaskMapHandler(BaseHTTPRequestHandler):
         if tile_cache is not None:
             tiles, cache_bbox = tile_cache
             tile_names = tuple(tile.name for tile in tiles)
-            cache_key = xcm_cache_digest("source-tiles", source_key, cache_bbox, tile_names)
+            cache_key = xcm_cache_digest(
+                "source-tiles",
+                source_key,
+                cache_bbox,
+                tile_names,
+                terrain_arcsec=terrain_arcsec,
+            )
             cached = read_cached_xcm(cache_key)
             if cached is not None:
                 data, metadata, _ = cached
@@ -2848,6 +2901,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                     runway_error="",
                     map_source="xcm-cache",
                     cache_status="hit",
+                    terrain_arcsec=terrain_arcsec,
                     cache_key=cache_key,
                     tile_names=tile_names,
                 )
@@ -2862,8 +2916,10 @@ class TaskMapHandler(BaseHTTPRequestHandler):
 
             data, mapgen_error = generate_map_from_mapgen(
                 cache_bbox,
-                "tiles_" + "_".join(name.rsplit("/", 1)[-1] for name in tile_names),
+                f"{terrain_arcsec}arc_tiles_"
+                + "_".join(name.rsplit("/", 1)[-1] for name in tile_names),
                 runway_features=runway_features,
+                terrain_arcsec=terrain_arcsec,
             )
             if data is None:
                 self.log_message(
@@ -2883,6 +2939,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                     len(data),
                     len(runway_features),
                     runway_source,
+                    terrain_arcsec,
                 )
                 metadata["cache_key"] = cache_key
                 save_cached_xcm(cache_key, data, metadata)
@@ -2897,12 +2954,18 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                     runway_error=runway_error,
                     map_source="mapgen-source-tiles",
                     cache_status="miss-filled",
+                    terrain_arcsec=terrain_arcsec,
                     cache_key=cache_key,
                     tile_names=tile_names,
                 )
                 return
 
-        exact_key = xcm_cache_digest("exact-bbox", source_key, bbox)
+        exact_key = xcm_cache_digest(
+            "exact-bbox",
+            source_key,
+            bbox,
+            terrain_arcsec=terrain_arcsec,
+        )
         cached = read_cached_xcm(exact_key)
         if cached is not None:
             data, metadata, _ = cached
@@ -2918,6 +2981,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
                 runway_error="",
                 map_source="xcm-cache",
                 cache_status="exact-hit",
+                terrain_arcsec=terrain_arcsec,
                 cache_key=exact_key,
             )
             return
@@ -2933,6 +2997,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             bbox,
             map_name,
             runway_features=runway_features,
+            terrain_arcsec=terrain_arcsec,
         )
         if data is None:
             self.send_text(500, f"task map failed: {mapgen_error}")
@@ -2948,6 +3013,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             len(data),
             len(runway_features),
             runway_source,
+            terrain_arcsec,
         )
         metadata["cache_key"] = exact_key
         save_cached_xcm(exact_key, data, metadata)
@@ -2962,6 +3028,7 @@ class TaskMapHandler(BaseHTTPRequestHandler):
             runway_error=runway_error,
             map_source="mapgen",
             cache_status="exact-miss-filled",
+            terrain_arcsec=terrain_arcsec,
             cache_key=exact_key,
         )
 
@@ -2984,7 +3051,10 @@ def main():
         "base_crop="
         + ("on" if TASK_MAP_USE_BASE_CROP else "off")
         + "; bases="
-        + ", ".join(str(base.path) for base in TaskMapHandler.base_maps),
+        + ", ".join(
+            "{}:{}arc".format(base.path, base.terrain_arcsec)
+            for base in TaskMapHandler.base_maps
+        ),
         flush=True,
     )
     server.serve_forever()

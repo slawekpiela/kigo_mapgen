@@ -182,9 +182,10 @@ Check the source data repository manifest for exact data-source notices.
         dir_data=None,
         task_routes=None,
         task_terrain_margin=30.0,
+        allow_1arc=False,
     ):
         print("Adding terrain...")
-        if float(arcseconds_per_pixel) < 3.0:
+        if float(arcseconds_per_pixel) < 3.0 and not allow_1arc:
             raise RuntimeError("1 arc-second terrain generation is disabled.")
 
         if not bounds:

@@ -127,7 +127,10 @@ class Worker:
             raise RuntimeError("1 arc-second terrain is disabled.")
         if getattr(description, "level_of_detail", 3) > 3:
             raise RuntimeError("Topology level 4 is disabled.")
-        if float(getattr(description, "resolution", 9.0)) < 3.0:
+        if (
+            float(getattr(description, "resolution", 9.0)) < 3.0
+            and not getattr(description, "terrain_1arc", False)
+        ):
             raise RuntimeError("1 arc-second terrain is disabled.")
 
         if not getattr(description, "high_quality", False):
@@ -186,15 +189,14 @@ class Worker:
                     task_terrain_margin = getattr(
                         description, "task_terrain_margin", 30.0
                     )
-                    if getattr(description, "terrain_plus", False) and not getattr(
-                        description, "high_quality", False
-                    ):
+                    if getattr(description, "terrain_1arc", False):
                         with self.__high_quality_data_environment() as terrain_data:
                             generator.add_terrain(
                                 description.resolution,
                                 dir_data=terrain_data,
                                 task_routes=task_routes,
                                 task_terrain_margin=task_terrain_margin,
+                                allow_1arc=True,
                             )
                     else:
                         generator.add_terrain(

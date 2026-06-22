@@ -37,11 +37,15 @@ osm/planet.7z
 81483da7a63eedc6898f629e0ad9d2a1  dem1/n49e019.hgt
 ```
 
-## Disabled higher-resolution terrain
+## 1 arc-second TaskMap terrain
 
-1 arc-second terrain generation is disabled in the web frontend, worker, CLI,
-and `Generator.add_terrain()`.  Kigo/TaskMap uses standard mapgen topology with
-3 arc-second terrain (`highres=on`) plus the runway post-process.
+The public web high-quality modes remain disabled, but TaskMap may request
+terrain-only 1 arc-second generation with the internal `terrain_1arc` mapgen
+form flag. This keeps standard mapgen topology (`level_of_detail` 1-3) and uses
+DEM1 only for `terrain.jp2`.
+
+Normal web and CLI entry points still reject 1 arc-second terrain unless this
+TaskMap-only flag is set by the HTTP task-map service.
 
 ## Higher-detail topology
 
